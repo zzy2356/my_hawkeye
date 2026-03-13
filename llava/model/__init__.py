@@ -1,2 +1,3 @@
 from .language_model.llava_llama import LlavaLlamaForCausalLM, LlavaConfig
 from .language_model.llava_mpt import LlavaMPTForCausalLM, LlavaMPTConfig
+from .language_model.qwen3_vl_hawkeye import Qwen3VLHawkeyeAdapter, load_pretrained_qwen3vl_hawkeye_model

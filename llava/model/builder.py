@@ -21,6 +21,12 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, BitsAn
 import torch
 from llava.model import *
 from llava.constants import DEFAULT_X_PATCH_TOKEN, DEFAULT_X_START_TOKEN, DEFAULT_X_END_TOKEN
+from llava.model.language_model.qwen3_vl_hawkeye import load_pretrained_qwen3vl_hawkeye_model
+
+
+def _is_qwen3_vl_model(model_name):
+    normalized_name = (model_name or "").lower().replace("-", "").replace("_", "")
+    return "qwen3" in normalized_name and "vl" in normalized_name
 
 
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda"):
@@ -42,7 +48,17 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
     else:
         kwargs['torch_dtype'] = torch.float16
 
-    if 'llava' or 'hawkeye' in model_name.lower():
+    if _is_qwen3_vl_model(model_name):
+        return load_pretrained_qwen3vl_hawkeye_model(
+            model_path=model_path,
+            model_base=model_base,
+            load_8bit=load_8bit,
+            load_4bit=load_4bit,
+            device_map=device_map,
+            device=device,
+        )
+
+    if 'llava' in model_name.lower() or 'hawkeye' in model_name.lower():
         # Load LLaVA model
         if 'lora' in model_name.lower() and model_base is None:
             warnings.warn('There is `lora` in model name but no `model_base` is provided. If you are loading a LoRA model, please provide the `model_base` argument. Detailed instruction: https://github.com/haotian-liu/LLaVA#launch-a-model-worker-lora-weights-unmerged.')
@@ -138,7 +154,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 model = AutoModelForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
 
     processor = {}
-    if 'llava' or 'hawkeye' in model_name.lower():
+    if 'llava' in model_name.lower() or 'hawkeye' in model_name.lower():
         mm_use_x_start_end = getattr(model.config, "mm_use_x_start_end", False)
         mm_use_x_patch_token = getattr(model.config, "mm_use_x_patch_token", True)
         X = model.config.X

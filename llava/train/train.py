@@ -17,11 +17,12 @@
 import os
 import copy
 import random
+import re
 from dataclasses import dataclass, field
 import json
 import logging
 import pathlib
-from typing import Dict, Optional, Sequence, List
+from typing import Any, Dict, Optional, Sequence, List
 import numpy as np
 import pandas as pd
 
@@ -37,6 +38,7 @@ from llava.train.llava_trainer import LLaVATrainer
 
 from llava import conversation as conversation_lib
 from llava.model import *
+from llava.model.language_model.qwen3_vl_hawkeye import load_pretrained_qwen3vl_hawkeye_model
 from llava.mm_utils import tokenizer_X_token
 
 from PIL import Image
@@ -48,6 +50,27 @@ local_rank = None
 def rank0_print(*args):
     if local_rank == 0:
         print(*args)
+
+
+def _is_qwen3_vl_model_name(model_name_or_path: Optional[str]) -> bool:
+    normalized = (model_name_or_path or "").lower().replace("-", "").replace("_", "")
+    return "qwen3" in normalized and "vl" in normalized
+
+
+def _strip_media_tokens(text: str) -> str:
+    return re.sub(r"<\s*(video|image)\s*>", "", text, flags=re.IGNORECASE).strip()
+
+
+def _aux_stats_text(pose_feat: Optional[torch.Tensor], scene_feat: Optional[torch.Tensor]) -> str:
+    if pose_feat is None or scene_feat is None:
+        return ""
+
+    pose_feat = pose_feat.float()
+    scene_feat = scene_feat.float()
+    return (
+        f"pose_mean={pose_feat.mean().item():.4f}; pose_std={pose_feat.std().item():.4f}; "
+        f"scene_mean={scene_feat.mean().item():.4f}; scene_std={scene_feat.std().item():.4f}"
+    )
 
 
 @dataclass
@@ -740,6 +763,10 @@ class LazySupervisedDataset(Dataset):
                 sources = [sources]
             assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
 
+            use_qwen_multimodal = getattr(self.data_args, 'qwen_multimodal', False)
+            media_path = None
+            media_type = None
+
             if sources[0]['mode'] == 'motion' or sources[0]['mode'] == 'image':
                 pose_feat = None
                 scene_feat = None
@@ -773,12 +800,15 @@ class LazySupervisedDataset(Dataset):
             if 'image' in sources[0] or sources[0]['mode'] == 'image':
                 image_file = self.list_data_dict[i]['path']
                 image_folder = self.data_args.image_folder
-                processor = self.data_args.video_processor
                 video = os.path.join(image_folder, image_file)
-                video = processor(video, return_tensors='pt')['pixel_values'][0]
+                media_path = video
+                media_type = 'image'
+                if not use_qwen_multimodal:
+                    processor = self.data_args.video_processor
+                    video = processor(video, return_tensors='pt')['pixel_values'][0]
                 sources_ = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]),
                                                     self.data_args)
-                has_X = 'video'
+                has_X = None if use_qwen_multimodal else 'video'
 
             elif 'train' in sources[0]['mode']:
                 if sources[0]['mode'] == 'train':
@@ -805,22 +835,28 @@ class LazySupervisedDataset(Dataset):
                                     "value"] = "The video is an anomalistic video."
                     video_file = self.list_data_dict[i]['path']
                     video_folder = self.data_args.video_folder
-                    processor = self.data_args.video_processor
                     video = os.path.join(video_folder, video_file)
-                    video = processor(video, return_tensors='pt')['pixel_values'][0]
+                    media_path = video
+                    media_type = 'video'
+                    if not use_qwen_multimodal:
+                        processor = self.data_args.video_processor
+                        video = processor(video, return_tensors='pt')['pixel_values'][0]
                     sources_ = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]),
                                                      self.data_args)
-                    has_X = 'video'
+                    has_X = None if use_qwen_multimodal else 'video'
 
             elif sources[0]['mode'] == 'motion':
                 video_file = self.list_data_dict[i]['path']
                 video_folder = self.data_args.video_folder
-                processor = self.data_args.video_processor
                 video = os.path.join(video_folder, video_file)
-                video = processor(video, return_tensors='pt')['pixel_values'][0]
+                media_path = video
+                media_type = 'video'
+                if not use_qwen_multimodal:
+                    processor = self.data_args.video_processor
+                    video = processor(video, return_tensors='pt')['pixel_values'][0]
                 sources_ = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]),
                                                  self.data_args)
-                has_X = 'video'
+                has_X = None if use_qwen_multimodal else 'video'
             else:
                 sources_ = copy.deepcopy([e["conversations"] for e in sources])
 
@@ -856,6 +892,14 @@ class LazySupervisedDataset(Dataset):
             data_dict['pose_feat'] = pose_feat
             data_dict['scene_feat'] = scene_feat
 
+            if use_qwen_multimodal:
+                user_text = sources[0]["conversations"][0]["value"]
+                assistant_text = sources[0]["conversations"][1]["value"]
+                data_dict['qwen_user_text'] = user_text
+                data_dict['qwen_assistant_text'] = assistant_text
+                data_dict['qwen_media_path'] = media_path
+                data_dict['qwen_media_type'] = media_type
+
             return data_dict
 
         except Exception as e:
@@ -874,8 +918,84 @@ class DataCollatorForSupervisedDataset(object):
     """Collate examples for supervised fine-tuning."""
 
     tokenizer: transformers.PreTrainedTokenizer
+    qwen_multimodal: bool = False
+    qwen_processor: Optional[Any] = None
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+        if self.qwen_multimodal:
+            if self.qwen_processor is None:
+                raise ValueError("qwen_processor is required when qwen_multimodal=True")
+
+            encoded_batches = []
+            for instance in instances:
+                user_text = _strip_media_tokens(instance.get('qwen_user_text', ''))
+                aux_text = _aux_stats_text(instance.get('pose_feat'), instance.get('scene_feat'))
+                if aux_text:
+                    user_text = f"{user_text}\nAuxiliary scene stats: {aux_text}"
+
+                media_path = instance.get('qwen_media_path')
+                media_type = instance.get('qwen_media_type')
+                content = []
+                if media_path is not None:
+                    if media_type == 'image':
+                        content.append({'type': 'image', 'image': media_path})
+                    else:
+                        content.append({'type': 'video', 'video': media_path})
+                content.append({'type': 'text', 'text': user_text})
+
+                messages = [
+                    {'role': 'user', 'content': content},
+                    {'role': 'assistant', 'content': [{'type': 'text', 'text': instance.get('qwen_assistant_text', '')}]},
+                ]
+
+                encoded = self.qwen_processor.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=False,
+                    return_dict=True,
+                    return_tensors='pt',
+                )
+                encoded_batches.append(encoded)
+
+            pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+            input_ids = torch.nn.utils.rnn.pad_sequence(
+                [x['input_ids'][0] for x in encoded_batches],
+                batch_first=True,
+                padding_value=pad_id,
+            )
+            attention_mask = torch.nn.utils.rnn.pad_sequence(
+                [x['attention_mask'][0] for x in encoded_batches],
+                batch_first=True,
+                padding_value=0,
+            )
+            labels = input_ids.clone()
+            labels[attention_mask == 0] = IGNORE_INDEX
+
+            batch = {
+                'input_ids': input_ids,
+                'attention_mask': attention_mask,
+                'labels': labels,
+            }
+
+            optional_keys = ['pixel_values', 'pixel_values_videos', 'image_grid_thw', 'video_grid_thw']
+            for key in optional_keys:
+                values = [x[key] for x in encoded_batches if key in x]
+                if not values:
+                    continue
+                if isinstance(values[0], torch.Tensor):
+                    batch[key] = torch.cat(values, dim=0)
+                else:
+                    batch[key] = values
+
+            pose_values = [instance.get('pose_feat') for instance in instances]
+            scene_values = [instance.get('scene_feat') for instance in instances]
+            if all(v is not None for v in pose_values):
+                batch['pose_values'] = torch.stack(pose_values)
+            if all(v is not None for v in scene_values):
+                batch['scene_values'] = torch.stack(scene_values)
+
+            return batch
+
         input_ids, labels = tuple([instance[key] for instance in instances]
                                   for key in ("input_ids", "labels"))
         input_ids = torch.nn.utils.rnn.pad_sequence(
@@ -927,7 +1047,11 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
     train_dataset = LazySupervisedDataset(tokenizer=tokenizer,
                                           data_path=data_args.data_path,
                                           data_args=data_args)
-    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+    data_collator = DataCollatorForSupervisedDataset(
+        tokenizer=tokenizer,
+        qwen_multimodal=getattr(data_args, 'qwen_multimodal', False),
+        qwen_processor=getattr(data_args, 'qwen_processor', None),
+    )
     return dict(train_dataset=train_dataset,
                 eval_dataset=None,
                 data_collator=data_collator)
@@ -944,6 +1068,7 @@ def train():
     # training_args.device = 'cpu'
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
+    is_qwen3_vl = _is_qwen3_vl_model_name(model_args.model_name_or_path)
 
     bnb_model_from_pretrained_args = {}
     if training_args.bits in [4, 8]:
@@ -962,8 +1087,22 @@ def train():
                 bnb_4bit_quant_type=training_args.quant_type  # {'fp4', 'nf4'}
             )
         ))
-    # print(model_args)
-    if model_args.image_tower is not None or model_args.video_tower is not None:  ####################################################
+    qwen_processor = None
+    if is_qwen3_vl:
+        tokenizer, model, processor_dict, _ = load_pretrained_qwen3vl_hawkeye_model(
+            model_path=model_args.model_name_or_path,
+            model_base=None,
+            load_8bit=training_args.bits == 8,
+            load_4bit=training_args.bits == 4,
+            device_map="auto",
+            device=training_args.device,
+        )
+        qwen_processor = processor_dict.get('qwen', None)
+        if qwen_processor is None:
+            raise ValueError('Qwen3-VL mode requires AutoProcessor, but it was not loaded.')
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+    elif model_args.image_tower is not None or model_args.video_tower is not None:  ####################################################
         if 'mpt' in model_args.model_name_or_path:
             config = transformers.AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
             config.attn_config['attn_impl'] = training_args.mpt_attn_impl
@@ -986,7 +1125,8 @@ def train():
             **bnb_model_from_pretrained_args
         )
     model.config.use_cache = False
-    model.config.X = model_args.X
+    if hasattr(model.config, 'X'):
+        model.config.X = model_args.X
 
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
@@ -1026,7 +1166,9 @@ def train():
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
 
-    if 'mpt' in model_args.model_name_or_path:
+    if is_qwen3_vl:
+        pass
+    elif 'mpt' in model_args.model_name_or_path:
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
@@ -1042,7 +1184,9 @@ def train():
             use_fast=False,
         )
 
-    if model_args.version == "v0":
+    if is_qwen3_vl:
+        tokenizer.pad_token = tokenizer.pad_token or tokenizer.eos_token
+    elif model_args.version == "v0":
         if tokenizer.pad_token is None:
             smart_tokenizer_and_embedding_resize(
                 special_tokens_dict=dict(pad_token="[PAD]"),
@@ -1058,7 +1202,13 @@ def train():
         else:
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
 
-    if model_args.image_tower is not None or model_args.video_tower is not None:  #############################
+    if is_qwen3_vl:
+        data_args.is_multimodal = True
+        data_args.qwen_multimodal = True
+        data_args.qwen_processor = qwen_processor
+        if training_args.per_device_train_batch_size > 1:
+            rank0_print('Qwen3-VL collator uses chat-template multimodal packing. Batch size > 1 may require more VRAM.')
+    elif model_args.image_tower is not None or model_args.video_tower is not None:  #############################
 
         if model_args.image_tower is not None:
             model.get_model().initialize_image_modules(

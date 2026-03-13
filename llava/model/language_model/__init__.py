@@ -1,0 +1,1 @@
+from .qwen3_vl_hawkeye import Qwen3VLHawkeyeAdapter, load_pretrained_qwen3vl_hawkeye_model
