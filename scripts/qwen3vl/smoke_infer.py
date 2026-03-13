@@ -68,8 +68,8 @@ def main() -> None:
         if isinstance(value, torch.Tensor):
             inputs[key] = value.to(model.device)
 
-    pose_values = torch.zeros((1, 5, 17, 5), dtype=torch.float16, device=model.device)
-    scene_values = torch.zeros((1, 5, 353), dtype=torch.float16, device=model.device)
+    pose_values = torch.zeros((5, 17, 5), dtype=torch.bfloat16, device=model.device)
+    scene_values = torch.zeros((5, 353), dtype=torch.bfloat16, device=model.device)
 
     with torch.inference_mode():
         output_ids = model.generate(

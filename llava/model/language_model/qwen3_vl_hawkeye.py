@@ -6,6 +6,8 @@ import torch.nn as nn
 from packaging.version import InvalidVersion, Version
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+IGNORE_INDEX = -100
+
 try:
     from transformers import AutoModelForImageTextToText
 except ImportError:
@@ -59,7 +61,6 @@ class Qwen3VLHawkeyeAdapter(nn.Module):
         self.scene_projector = nn.Linear(353, self._hidden_size)
         self.moe_projector = nn.Linear(self._hidden_size * 2, self._hidden_size)
         self._last_aux_features = None
-        self._warned_aux_passthrough = False
 
     @property
     def device(self) -> torch.device:
@@ -82,6 +83,7 @@ class Qwen3VLHawkeyeAdapter(nn.Module):
         return self.model.resize_token_embeddings(*args, **kwargs)
 
     def _pool_feature(self, values: torch.Tensor) -> torch.Tensor:
+        """Legacy helper kept for backward compatibility. Use encode_aux_features directly."""
         if values.ndim == 1:
             return values
         return values.reshape(-1, values.shape[-1]).mean(dim=0)
@@ -96,12 +98,20 @@ class Qwen3VLHawkeyeAdapter(nn.Module):
 
         features = []
         if pose_values is not None:
-            pose_values = self._pool_feature(pose_values).to(device=self.device, dtype=self.dtype)
-            features.append(self.pose_projector(pose_values))
+            # pose_values: (5, 17, 5) → mean across frames → (17, 5) → flatten → (85,)
+            # matches pose_projector input dim (17 joints × 5 dims = 85)
+            pv = pose_values.to(device=self.device, dtype=self.dtype)
+            if pv.ndim > 2:
+                pv = pv.mean(dim=0)  # (5,17,5) → (17,5)
+            pv = pv.reshape(-1)  # (17,5) → (85,)
+            features.append(self.pose_projector(pv))
 
         if scene_values is not None:
-            scene_values = self._pool_feature(scene_values).to(device=self.device, dtype=self.dtype)
-            features.append(self.scene_projector(scene_values))
+            # scene_values: (N, 353) → mean pool → (353,) to match scene_projector input dim
+            sv = scene_values.to(device=self.device, dtype=self.dtype)
+            if sv.ndim > 1:
+                sv = sv.mean(dim=0)
+            features.append(self.scene_projector(sv))
 
         if len(features) == 1:
             return features[0]
@@ -118,17 +128,57 @@ class Qwen3VLHawkeyeAdapter(nn.Module):
         scene_values = model_kwargs.pop("scene_values", None)
         self._last_aux_features = self.encode_aux_features(pose_values=pose_values, scene_values=scene_values)
 
-        if self._last_aux_features is not None and not self._warned_aux_passthrough:
-            warnings.warn(
-                "Qwen3-VL Hawkeye skeleton received pose/scene features, but the current minimal wrapper only stores "
-                "their projected representation. The features are not injected into the backbone yet."
-            )
-            self._warned_aux_passthrough = True
-
-        # Keep the wrapper resilient if upstream code passes data that this backend does not consume.
+        # Remove unused Hawkeye-specific kwargs
         for key in ("keys", "video_label"):
             if key in model_kwargs:
                 model_kwargs.pop(key)
+
+        return model_kwargs
+
+    def _inject_aux_features(self, model_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Prepend the projected aux-feature token to the input embedding sequence."""
+        if self._last_aux_features is None:
+            return model_kwargs
+
+        input_ids = model_kwargs.get("input_ids")
+        inputs_embeds = model_kwargs.get("inputs_embeds")
+
+        if input_ids is None and inputs_embeds is None:
+            return model_kwargs
+
+        # Build inputs_embeds from input_ids if not already provided
+        if inputs_embeds is None:
+            inputs_embeds = self.model.get_input_embeddings()(input_ids)
+
+        aux = self._last_aux_features.to(dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+        # (hidden,) → (batch, 1, hidden)
+        aux_token = aux.unsqueeze(0).unsqueeze(0).expand(inputs_embeds.shape[0], -1, -1)
+        inputs_embeds = torch.cat([aux_token, inputs_embeds], dim=1)
+        model_kwargs["inputs_embeds"] = inputs_embeds
+
+        # Prepend a dummy token id so that Qwen3-VL visual-token detection stays aligned
+        # with the extended inputs_embeds sequence.
+        if input_ids is not None:
+            pad_id = getattr(self.model.config, "pad_token_id", None) or 0
+            dummy = torch.full(
+                (input_ids.shape[0], 1), pad_id,
+                device=input_ids.device, dtype=input_ids.dtype,
+            )
+            model_kwargs["input_ids"] = torch.cat([dummy, input_ids], dim=1)
+
+        if "attention_mask" in model_kwargs:
+            am = model_kwargs["attention_mask"]
+            model_kwargs["attention_mask"] = torch.cat(
+                [torch.ones(am.shape[0], 1, device=am.device, dtype=am.dtype), am], dim=1
+            )
+
+        if "labels" in model_kwargs:
+            labels = model_kwargs["labels"]
+            ignore_token = torch.full(
+                (labels.shape[0], 1), IGNORE_INDEX,
+                device=labels.device, dtype=labels.dtype,
+            )
+            model_kwargs["labels"] = torch.cat([ignore_token, labels], dim=1)
 
         return model_kwargs
 
@@ -156,10 +206,12 @@ class Qwen3VLHawkeyeAdapter(nn.Module):
 
     def forward(self, *args, **kwargs):
         model_kwargs = self._strip_hawkeye_kwargs(kwargs)
+        model_kwargs = self._inject_aux_features(model_kwargs)
         return self.model(*args, **model_kwargs)
 
     def generate(self, *args, **kwargs):
         model_kwargs = self._strip_hawkeye_kwargs(kwargs)
+        model_kwargs = self._inject_aux_features(model_kwargs)
         return self.model.generate(*args, **model_kwargs)
 
 
@@ -173,7 +225,7 @@ def load_pretrained_qwen3vl_hawkeye_model(
 ) -> Tuple[Any, Qwen3VLHawkeyeAdapter, Dict[str, Any], int]:
     kwargs: Dict[str, Any] = {
         "device_map": device_map,
-        "cache_dir": r"./",
+        "cache_dir": r"./",  # Change to an absolute path if needed, e.g. /home/djingwang/zyzhu/cache
         "trust_remote_code": True,
     }
 
@@ -190,7 +242,7 @@ def load_pretrained_qwen3vl_hawkeye_model(
             bnb_4bit_quant_type="nf4",
         )
     else:
-        kwargs["torch_dtype"] = torch.float16
+        kwargs["torch_dtype"] = torch.bfloat16
 
     backbone_path = model_path
     if model_base is not None:
@@ -199,10 +251,10 @@ def load_pretrained_qwen3vl_hawkeye_model(
             "Loading model_path directly."
         )
     version = _get_transformers_version()
-    if version is not None and version < Version("4.37.0"):
+    if version is not None and version < Version("4.57.0"):
         warnings.warn(
-            "The current transformers version is old for recent Qwen-VL backbones. "
-            "This skeleton uses trust_remote_code, but upgrading transformers is recommended before training."
+            "The current transformers version is too old for Qwen3-VL. "
+            "Please upgrade to transformers >= 4.57.0 before running."
         )
 
     config = AutoConfig.from_pretrained(backbone_path, trust_remote_code=True)
