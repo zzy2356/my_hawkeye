@@ -64,7 +64,6 @@ def _aux_stats_text(pose_feature: torch.Tensor, scene_feature: torch.Tensor) -> 
 def _run_qwen3_vl_inference(model, processor, video_path: str, prompt: str, pose_feature: torch.Tensor,
                             scene_feature: torch.Tensor, max_new_tokens: int = 32) -> str:
     user_text = _strip_media_tokens(prompt)
-    user_text = f"{user_text}\nAuxiliary scene stats: {_aux_stats_text(pose_feature, scene_feature)}"
 
     messages = [
         {
@@ -87,10 +86,22 @@ def _run_qwen3_vl_inference(model, processor, video_path: str, prompt: str, pose
         if isinstance(value, torch.Tensor):
             inputs[key] = value.to(model.device)
 
-    with torch.inference_mode():
-        generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+    input_len = inputs["input_ids"].shape[1]
 
-    trimmed_ids = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)]
+    with torch.inference_mode():
+        generated_ids = model.generate(
+            **inputs,
+            pose_values=pose_feature,
+            scene_values=scene_feature,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+        )
+
+    # Account for any aux tokens prepended by the adapter during generate
+    if hasattr(model, '_last_aux_features') and model._last_aux_features is not None:
+        input_len += 1
+
+    trimmed_ids = [out_ids[input_len:] for out_ids in generated_ids]
     outputs = processor.batch_decode(trimmed_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
     return outputs[0].strip() if len(outputs) > 0 else ""
 
@@ -98,8 +109,7 @@ def _run_qwen3_vl_inference(model, processor, video_path: str, prompt: str, pose
 def main():
     disable_torch_init()
 
-    model_path = 'models/Qwen3-VL-8B-Instruct'
-    # model_path = 'LanguageBind/video-llava-7b'
+    model_path = os.environ.get('HAWKEYE_MODEL_PATH', '/home/djingwang/zyzhu/models/Qwen3-VL-8B-Instruct')
     model_base = None
     # model_base = None
     device = 'cuda'
@@ -111,7 +121,7 @@ def main():
     video_processor = processor.get('video')
     qwen_processor = processor.get('qwen')
 
-    for video_id_folder in tqdm(os.listdir('dataset/vid_split/test')):
+    for video_id_folder in tqdm(os.listdir('dataset/vid_split/test_new')):
         # if video_id_folder == '295_Ekman6_anger_932':
         print(video_id_folder)
         video_id_folder_path = os.path.join('dataset/vid_split/test_new', video_id_folder)

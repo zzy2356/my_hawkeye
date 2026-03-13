@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DATA_ROOT="dataset/vid_noaudio_split/train_new"
-IMAGE_ROOT="dataset"
-MODEL_PATH="models/Qwen3-VL-8B-Instruct"
-OUT_DIR="output_folder/Hawkeye-Qwen3VL-debug"
+WORK_ROOT="${HAWKEYE_WORK_ROOT:-/home/djingwang/zyzhu}"
+DATA_ROOT="${WORK_ROOT}/dataset/vid_noaudio_split/train_new"
+IMAGE_ROOT="${WORK_ROOT}/dataset"
+MODEL_PATH="${HAWKEYE_MODEL_PATH:-${WORK_ROOT}/models/Qwen3-VL-8B-Instruct}"
+OUT_DIR="${WORK_ROOT}/output_folder/Hawkeye-Qwen3VL-debug"
 
 # Minimal debug run: verify data/collator/model path with tiny steps.
 deepspeed --master_port=29503 train_mem.py \
@@ -12,7 +13,7 @@ deepspeed --master_port=29503 train_mem.py \
   --lora_enable True \
   --model_name_or_path "${MODEL_PATH}" \
   --version v1 \
-  --data_path dataset/new_train.json \
+  --data_path "${WORK_ROOT}/dataset/new_train.json" \
   --video_folder "${DATA_ROOT}" \
   --image_folder "${IMAGE_ROOT}" \
   --bf16 True \
