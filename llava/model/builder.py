@@ -16,6 +16,7 @@
 import os
 import warnings
 import shutil
+import json
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, BitsAndBytesConfig
 import torch
@@ -24,9 +25,28 @@ from llava.constants import DEFAULT_X_PATCH_TOKEN, DEFAULT_X_START_TOKEN, DEFAUL
 from llava.model.language_model.qwen3_vl_hawkeye import load_pretrained_qwen3vl_hawkeye_model
 
 
-def _is_qwen3_vl_model(model_name):
-    normalized_name = (model_name or "").lower().replace("-", "").replace("_", "")
+def _matches_qwen3_vl(candidate):
+    normalized_name = (candidate or "").lower().replace("-", "").replace("_", "")
     return "qwen3" in normalized_name and "vl" in normalized_name
+
+
+def _read_json_field(path, field):
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            payload = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload.get(field)
+
+
+def _is_qwen3_vl_model(model_name, model_path=None, model_base=None):
+    candidates = [model_name, model_path, model_base]
+    adapter_base = _read_json_field(os.path.join(model_path or "", "adapter_config.json"), "base_model_name_or_path")
+    config_model_type = _read_json_field(os.path.join(model_path or "", "config.json"), "model_type")
+    candidates.extend([adapter_base, config_model_type])
+    return any(_matches_qwen3_vl(candidate) for candidate in candidates if candidate)
 
 
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda"):
@@ -48,7 +68,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
     else:
         kwargs['torch_dtype'] = torch.float16
 
-    if _is_qwen3_vl_model(model_name):
+    if _is_qwen3_vl_model(model_name, model_path=model_path, model_base=model_base):
         return load_pretrained_qwen3vl_hawkeye_model(
             model_path=model_path,
             model_base=model_base,

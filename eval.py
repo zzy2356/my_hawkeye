@@ -1,326 +1,300 @@
-import torch
-import numpy as np
-import re
-from llava.constants import X_TOKEN_INDEX, DEFAULT_X_TOKEN
-from llava.conversation import conv_templates, SeparatorStyle
-from llava.model.builder import load_pretrained_model
-from llava.utils import disable_torch_init
-from llava.mm_utils import tokenizer_X_token, get_model_name_from_path, KeywordsStoppingCriteria
-from peft import get_peft_config, get_peft_model, get_peft_model_state_dict, LoraConfig, TaskType
-import pandas as pd
+import os
+import warnings
+from typing import Iterable, Optional
 
+import numpy as np
+import pandas as pd
+import torch
+from tqdm import tqdm
 from transformers import logging
 
-logging.set_verbosity_error()
-import warnings
-import os
-from tqdm import tqdm
+from llava.constants import DEFAULT_X_TOKEN, X_TOKEN_INDEX
+from llava.conversation import SeparatorStyle, conv_templates
+from llava.mm_utils import KeywordsStoppingCriteria, get_model_name_from_path, tokenizer_X_token
+from llava.model.builder import load_pretrained_model
+from llava.train.qwen3vl_data import preprocess_qwen3vl_visual
+from llava.utils import disable_torch_init
 
+logging.set_verbosity_error()
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
-
-warnings.filterwarnings("ignore", category=FutureWarning, module="transformers", lineno=1656)
-warnings.filterwarnings("ignore")
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-logging.set_verbosity_warning()
-logging.set_verbosity_error()
-
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-with warnings.catch_warnings():
-    warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore")
+
+IASDIG_PROMPT = (
+    "Please determine if the people in the video or the video itself show negative emotions."
+)
+UCF_PROMPT = (
+    "Please determine whether the video is an anomalistic video that contains one of Abuse, Arrest, "
+    "Arson, Assault, Accident, Burglary, Explosion, Fighting, Robbery, Shooting, Stealing, "
+    "Shoplifting, and Vandalism."
+)
 
 
-def find_all_linear_names(model):
-    cls = torch.nn.Linear
-    lora_module_names = set()
-    for name, module in model.named_modules():
-        if isinstance(module, cls):
-            names = name.split('.')
-            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
-
-    if 'lm_head' in lora_module_names:  # needed for 16-bit
-        lora_module_names.remove('lm_head')
-    return list(lora_module_names)
-
-
-def _is_qwen3_vl_model_name(model_name_or_path: str) -> bool:
+def _is_qwen3_vl_model_name(model_name_or_path: Optional[str]) -> bool:
     normalized = (model_name_or_path or "").lower().replace("-", "").replace("_", "")
     return "qwen3" in normalized and "vl" in normalized
 
 
-def _strip_media_tokens(text: str) -> str:
-    return re.sub(r"<\s*(video|image)\s*>", "", text, flags=re.IGNORECASE).strip()
+def _pick_existing_path(*candidates: str) -> Optional[str]:
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return None
 
 
-def _aux_stats_text(pose_feature: torch.Tensor, scene_feature: torch.Tensor) -> str:
-    pose_feature = pose_feature.float()
-    scene_feature = scene_feature.float()
-    return (
-        f"pose_mean={pose_feature.mean().item():.4f}; pose_std={pose_feature.std().item():.4f}; "
-        f"scene_mean={scene_feature.mean().item():.4f}; scene_std={scene_feature.std().item():.4f}"
+def _model_device(model) -> torch.device:
+    return getattr(model, "device", next(model.parameters()).device)
+
+
+def _resolve_scene_feature_path(base_dir: str, folder: str, filename: str) -> str:
+    resolved = _pick_existing_path(
+        os.path.join(base_dir, "graph_feat", folder, filename),
+        os.path.join(base_dir, "rel_feat", folder, filename),
+    )
+    if resolved is None:
+        raise FileNotFoundError(f"Scene feature not found for {folder}/{filename} under {base_dir}.")
+    return resolved
+
+
+def _load_temporal_feature(path: str, target_frames: int, feature_shape: Iterable[int]) -> torch.Tensor:
+    feature = torch.from_numpy(np.load(path)).float()
+    feature = feature[:target_frames]
+    if feature.size(0) < target_frames:
+        pad_shape = (target_frames - feature.size(0), *feature_shape)
+        feature = torch.cat((feature, torch.zeros(pad_shape, dtype=feature.dtype)), dim=0)
+    return feature
+
+
+def _sorted_videos(folder_path: str):
+    def _video_sort_key(filename: str):
+        try:
+            return int(filename.split("_")[1].split(".")[0])
+        except (IndexError, ValueError):
+            return filename
+
+    return sorted(
+        [name for name in os.listdir(folder_path) if os.path.isfile(os.path.join(folder_path, name))],
+        key=_video_sort_key,
     )
 
 
-def _run_qwen3_vl_inference(model, processor, video_path: str, prompt: str, pose_feature: torch.Tensor,
-                            scene_feature: torch.Tensor, max_new_tokens: int = 32) -> str:
-    user_text = _strip_media_tokens(prompt)
-
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "video", "video": video_path},
-                {"type": "text", "text": user_text},
-            ],
-        }
-    ]
-
-    inputs = processor.apply_chat_template(
-        messages,
-        tokenize=True,
+def _run_qwen3_vl_inference(
+    model,
+    processor,
+    video_path: str,
+    prompt: str,
+    pose_feature: torch.Tensor,
+    scene_feature: torch.Tensor,
+    max_new_tokens: int,
+) -> str:
+    conversations = [{"from": "human", "value": f"{prompt}\n<video>"}]
+    model_inputs = preprocess_qwen3vl_visual(
+        conversations=conversations,
+        processor=processor,
+        media_path=video_path,
+        media_type="video",
         add_generation_prompt=True,
-        return_dict=True,
-        return_tensors="pt",
+        include_labels=False,
     )
-    for key, value in list(inputs.items()):
-        if isinstance(value, torch.Tensor):
-            inputs[key] = value.to(model.device)
+    input_len = model_inputs["input_ids"].shape[1]
 
-    input_len = inputs["input_ids"].shape[1]
+    for key, value in list(model_inputs.items()):
+        if isinstance(value, torch.Tensor):
+            model_inputs[key] = value.to(_model_device(model))
+
+    pose_values = pose_feature.unsqueeze(0).to(_model_device(model))
+    scene_values = scene_feature.unsqueeze(0).to(_model_device(model))
 
     with torch.inference_mode():
         generated_ids = model.generate(
-            **inputs,
-            pose_values=pose_feature,
-            scene_values=scene_feature,
+            **model_inputs,
+            pose_values=pose_values,
+            scene_values=scene_values,
             max_new_tokens=max_new_tokens,
             do_sample=False,
         )
 
-    # Account for any aux tokens prepended by the adapter during generate
-    if hasattr(model, '_last_aux_features') and model._last_aux_features is not None:
-        input_len += 1
-
-    trimmed_ids = [out_ids[input_len:] for out_ids in generated_ids]
+    trimmed_ids = [output_ids[input_len:] for output_ids in generated_ids]
     outputs = processor.batch_decode(trimmed_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-    return outputs[0].strip() if len(outputs) > 0 else ""
+    return outputs[0].strip() if outputs else ""
+
+
+def _run_legacy_hawkeye_inference(
+    model,
+    tokenizer,
+    video_processor,
+    video_path: str,
+    prompt: str,
+    pose_feature: torch.Tensor,
+    scene_feature: torch.Tensor,
+    max_new_tokens: int,
+) -> str:
+    conv = conv_templates["llava_v1"].copy()
+    conv.append_message(conv.roles[0], DEFAULT_X_TOKEN["VIDEO"] + "\n" + prompt)
+    conv.append_message(conv.roles[1], None)
+    prompt_text = conv.get_prompt()
+
+    input_ids = tokenizer_X_token(
+        prompt_text,
+        tokenizer,
+        X_TOKEN_INDEX["VIDEO"],
+        return_tensors="pt",
+    ).unsqueeze(0).to(_model_device(model))
+
+    video_tensor = video_processor(video_path, return_tensors="pt")["pixel_values"]
+    if isinstance(video_tensor, list):
+        video_tensor = [video.to(_model_device(model), dtype=torch.float16) for video in video_tensor]
+    else:
+        video_tensor = video_tensor.to(_model_device(model), dtype=torch.float16)
+
+    pose_values = pose_feature.to(_model_device(model), dtype=torch.float16)
+    scene_values = scene_feature.to(_model_device(model), dtype=torch.float16)
+    stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
+    stopping_criteria = KeywordsStoppingCriteria([stop_str], tokenizer, input_ids)
+
+    with torch.inference_mode():
+        output_ids = model.generate(
+            input_ids,
+            images=[video_tensor, [pose_values], [scene_values], ["video"]],
+            do_sample=False,
+            temperature=0.0,
+            max_new_tokens=max_new_tokens,
+            use_cache=True,
+            stopping_criteria=[stopping_criteria],
+        )
+
+    return tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=True).strip()
+
+
+def _evaluate_folder_dataset(
+    root_dir: str,
+    pose_root: str,
+    scene_root: str,
+    save_root: str,
+    prompt: str,
+    tokenizer,
+    model,
+    processor_dict,
+    is_qwen3_vl: bool,
+    max_new_tokens: int,
+    skip_if_contains: Optional[str] = None,
+) -> None:
+    if not os.path.isdir(root_dir):
+        print(f"Skip missing dataset root: {root_dir}")
+        return
+
+    os.makedirs(save_root, exist_ok=True)
+    qwen_processor = processor_dict.get("qwen")
+    video_processor = processor_dict.get("video")
+
+    for folder_name in tqdm(sorted(os.listdir(root_dir))):
+        if skip_if_contains and skip_if_contains in folder_name:
+            continue
+
+        folder_path = os.path.join(root_dir, folder_name)
+        if not os.path.isdir(folder_path):
+            continue
+
+        outputs = []
+        filenames = []
+        for video_name in tqdm(_sorted_videos(folder_path), leave=False):
+            video_path = os.path.join(folder_path, video_name)
+            filenames.append(video_name)
+
+            frame_file = f"frame_{int(video_name.split('.')[0])}.npy"
+            pose_path = os.path.join(pose_root, folder_name, frame_file)
+            scene_path = _resolve_scene_feature_path(scene_root, folder_name, frame_file)
+
+            pose_feature = _load_temporal_feature(pose_path, target_frames=5, feature_shape=(17, 5))
+            scene_feature = _load_temporal_feature(scene_path, target_frames=5, feature_shape=(353,))
+
+            if is_qwen3_vl:
+                if qwen_processor is None:
+                    raise ValueError("Qwen3-VL inference requires processor['qwen'].")
+                result = _run_qwen3_vl_inference(
+                    model=model,
+                    processor=qwen_processor,
+                    video_path=video_path,
+                    prompt=prompt,
+                    pose_feature=pose_feature,
+                    scene_feature=scene_feature,
+                    max_new_tokens=max_new_tokens,
+                )
+            else:
+                if video_processor is None:
+                    raise ValueError("Legacy Hawkeye inference requires processor['video'].")
+                result = _run_legacy_hawkeye_inference(
+                    model=model,
+                    tokenizer=tokenizer,
+                    video_processor=video_processor,
+                    video_path=video_path,
+                    prompt=prompt,
+                    pose_feature=pose_feature,
+                    scene_feature=scene_feature,
+                    max_new_tokens=max_new_tokens,
+                )
+
+            outputs.append(result)
+
+        pd.DataFrame({"file": filenames, "output": outputs}).to_csv(
+            os.path.join(save_root, f"{folder_name}.csv"),
+            index=False,
+        )
 
 
 def main():
     disable_torch_init()
 
-    model_path = os.environ.get('HAWKEYE_MODEL_PATH', '/home/djingwang/zyzhu/models/Qwen3-VL-8B-Instruct')
-    model_base = None
-    # model_base = None
-    device = 'cuda'
-    load_4bit, load_8bit = False, False
-    model_name = get_model_name_from_path(model_path)
-    is_qwen3_vl = _is_qwen3_vl_model_name(model_path)
-    tokenizer, model, processor, context_len = load_pretrained_model(model_path, model_base, model_name, load_8bit,
-                                                                     load_4bit, device=device)
-    video_processor = processor.get('video')
-    qwen_processor = processor.get('qwen')
+    model_path = os.environ.get("HAWKEYE_MODEL_PATH", "models/Qwen3-VL-8B-Instruct")
+    model_base = os.environ.get("HAWKEYE_MODEL_BASE") or None
+    device = os.environ.get("HAWKEYE_DEVICE", "cuda")
+    load_4bit = os.environ.get("HAWKEYE_LOAD_4BIT", "0") == "1"
+    load_8bit = os.environ.get("HAWKEYE_LOAD_8BIT", "0") == "1"
+    model_name = get_model_name_from_path(model_base or model_path)
 
-    for video_id_folder in tqdm(os.listdir('dataset/vid_split/test_new')):
-        # if video_id_folder == '295_Ekman6_anger_932':
-        print(video_id_folder)
-        video_id_folder_path = os.path.join('dataset/vid_split/test_new', video_id_folder)
-        video_list = []
-        name = []
-        res = []
-        for video in os.listdir(video_id_folder_path):
-            video_list.append(video)
-        video_list = sorted(video_list, key=lambda x: int(x.split("_")[1].split(".")[0]))
+    tokenizer, model, processor_dict, _ = load_pretrained_model(
+        model_path=model_path,
+        model_base=model_base,
+        model_name=model_name,
+        load_8bit=load_8bit,
+        load_4bit=load_4bit,
+        device=device,
+    )
 
-        for video in tqdm(video_list):
-            name.append(video)
-            video_path = os.path.join(video_id_folder_path, video)
-            pose_path = os.path.join('dataset/pose_feat/test/{}'.format(video_id_folder),
-                                    'frame_{}.npy'.format(int(video.split('.')[0])))
+    is_qwen3_vl = _is_qwen3_vl_model_name(model_path) or _is_qwen3_vl_model_name(model_base)
 
-            pose_feature = torch.from_numpy(np.load(pose_path))
-            if pose_feature.size(0) < 5:
-                padding_size = 5 - pose_feature.size(0)
-                pose_feature_pad = torch.cat((pose_feature, torch.zeros((padding_size, 17, 5))), dim=0)
-            else:
-                pose_feature_pad = pose_feature[:5, :, :]
+    iasdig_root = _pick_existing_path("dataset/vid_split/test_new", "dataset/vid_noaudio_split/test_new")
+    if iasdig_root is not None:
+        _evaluate_folder_dataset(
+            root_dir=iasdig_root,
+            pose_root="dataset/pose_feat/test",
+            scene_root="dataset",
+            save_root="dataset/saved_result/test_res",
+            prompt=IASDIG_PROMPT,
+            tokenizer=tokenizer,
+            model=model,
+            processor_dict=processor_dict,
+            is_qwen3_vl=is_qwen3_vl,
+            max_new_tokens=16,
+        )
 
-            scene_path = os.path.join('dataset/graph_feat/test/{}'.format(video_id_folder),
-                                    'frame_{}.npy'.format(int(video.split('.')[0])))
-
-            scene_feature = torch.from_numpy(np.load(scene_path))
-            if scene_feature.size(0) < 5:
-                padding_size = 5 - scene_feature.size(0)
-                scene_feature_pad = torch.cat((scene_feature, torch.zeros((padding_size, 353))), dim=0)
-            else:
-                scene_feature_pad = scene_feature[:5, :]
-
-            inp = 'Your prompt here'
-
-            if is_qwen3_vl:
-                if qwen_processor is None:
-                    raise ValueError('Qwen3-VL inference requires processor["qwen"].')
-                outputs = _run_qwen3_vl_inference(
-                    model=model,
-                    processor=qwen_processor,
-                    video_path=video_path,
-                    prompt=inp,
-                    pose_feature=pose_feature_pad,
-                    scene_feature=scene_feature_pad,
-                    max_new_tokens=16,
-                )
-            else:
-                conv_mode = "llava_v1"
-                conv = conv_templates[conv_mode].copy()
-
-                video_tensor = video_processor(video_path, return_tensors='pt')['pixel_values']
-                if type(video_tensor) is list:
-                    tensor = [video.to(model.device, dtype=torch.float16) for video in video_tensor]
-                else:
-                    tensor = video_tensor.to(model.device, dtype=torch.float16)
-
-                if type(pose_feature_pad) is list:
-                    tensor_pose = [pose.to(model.device, dtype=torch.float16) for pose in pose_feature_pad]
-                else:
-                    tensor_pose = pose_feature_pad.to(model.device, dtype=torch.float16)
-
-                if type(scene_feature_pad) is list:
-                    tensor_scene = [scene.to(model.device, dtype=torch.float16) for scene in scene_feature_pad]
-                else:
-                    tensor_scene = scene_feature_pad.to(model.device, dtype=torch.float16)
-                key = ['video']
-
-                inp = DEFAULT_X_TOKEN['VIDEO'] + '\n' + inp
-                conv.append_message(conv.roles[0], inp)
-                conv.append_message(conv.roles[1], None)
-                prompt = conv.get_prompt()
-                input_ids = tokenizer_X_token(prompt, tokenizer, X_TOKEN_INDEX['VIDEO'], return_tensors='pt').unsqueeze(
-                    0).cuda()
-                stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
-                keywords = [stop_str]
-                stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
-
-                with torch.inference_mode():
-                    output_ids = model.generate(
-                        input_ids,
-                        images=[tensor, [tensor_pose], [tensor_scene], key],
-                        do_sample=True,
-                        temperature=0.1,
-                        max_new_tokens=16,
-                        use_cache=True,
-                        stopping_criteria=[stopping_criteria])
-
-                outputs = tokenizer.decode(output_ids[0, input_ids.shape[1]:]).strip()
-            # print(outputs)
-            res.append(outputs)
-        df = pd.DataFrame({
-            'file': name,
-            'output': res
-        })
-        save_path = 'dataset/saved_result/test_res/{}.csv'.format(video_id_folder)
-        df.to_csv(save_path, index=False)
-
-    for video_id_folder in tqdm(os.listdir('dataset/Ucf/Ucfcrime_split')):
-        if 'Normal' not in video_id_folder:
-            video_id_folder_path = os.path.join('dataset/Ucf/Ucfcrime_split', video_id_folder)
-            video_list = []
-            name = []
-            res = []
-            for video in os.listdir(video_id_folder_path):
-                video_list.append(video)
-            video_list = sorted(video_list, key=lambda x: int(x.split("_")[1].split(".")[0]))
-
-            for video in tqdm(video_list):
-                name.append(video)
-                video_path = os.path.join(video_id_folder_path, video)
-
-                pose_path = os.path.join('dataset/Ucf/pose_feat/{}'.format(video_id_folder),
-                                        'frame_{}.npy'.format(int(video.split('.')[0])))
-
-                pose_feature = torch.from_numpy(np.load(pose_path))
-                
-                if pose_feature.size(0) < 5:
-                    padding_size = 5 - pose_feature.size(0)
-                    pose_feature_pad = torch.cat((pose_feature, torch.zeros((padding_size, 17, 5))), dim=0)
-                else:
-                    pose_feature_pad = pose_feature[:5, :, :]
-
-                scene_path = os.path.join('dataset/Ucf/graph_feat/{}'.format(video_id_folder),
-                                    'frame_{}.npy'.format(int(video.split('.')[0])))
-
-                scene_feature = torch.from_numpy(np.load(scene_path))
-                if scene_feature.size(0) < 5:
-                    padding_size = 5 - scene_feature.size(0)
-                    scene_feature_pad = torch.cat((scene_feature, torch.zeros((padding_size, 353))), dim=0)
-                else:
-                    scene_feature_pad = scene_feature[:5, :]
-
-                inp = 'Your prompt here'
-
-                if is_qwen3_vl:
-                    if qwen_processor is None:
-                        raise ValueError('Qwen3-VL inference requires processor["qwen"].')
-                    outputs = _run_qwen3_vl_inference(
-                        model=model,
-                        processor=qwen_processor,
-                        video_path=video_path,
-                        prompt=inp,
-                        pose_feature=pose_feature_pad,
-                        scene_feature=scene_feature_pad,
-                        max_new_tokens=32,
-                    )
-                else:
-                    conv_mode = "llava_v1"
-                    conv = conv_templates[conv_mode].copy()
-
-                    video_tensor = video_processor(video_path, return_tensors='pt')['pixel_values']
-                    if type(video_tensor) is list:
-                        tensor = [video.to(model.device, dtype=torch.float16) for video in video_tensor]
-                    else:
-                        tensor = video_tensor.to(model.device, dtype=torch.float16)
-                        
-                    if type(pose_feature_pad) is list:
-                        tensor_pose = [pose.to(model.device, dtype=torch.float16) for pose in pose_feature_pad]
-                    else:
-                        tensor_pose = pose_feature_pad.to(model.device, dtype=torch.float16)
-
-                    if type(scene_feature_pad) is list:
-                        tensor_scene = [scene.to(model.device, dtype=torch.float16) for scene in scene_feature_pad]
-                    else:
-                        tensor_scene = scene_feature_pad.to(model.device, dtype=torch.float16)
-
-                    key = ['video']
-
-                    inp = DEFAULT_X_TOKEN['VIDEO'] + '\n' + inp
-                    conv.append_message(conv.roles[0], inp)
-                    conv.append_message(conv.roles[1], None)
-                    prompt = conv.get_prompt()
-                    input_ids = tokenizer_X_token(prompt, tokenizer, X_TOKEN_INDEX['VIDEO'], return_tensors='pt').unsqueeze(
-                        0).cuda()
-                    stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
-                    keywords = [stop_str]
-                    stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
-
-                    with torch.inference_mode():
-                        output_ids = model.generate(
-                            input_ids,
-                            images=[tensor, [tensor_pose], [tensor_scene], key],
-                            do_sample=True,
-                            temperature=0.1,
-                            max_new_tokens=32,
-                            use_cache=True,
-                            stopping_criteria=[stopping_criteria])
-
-                    outputs = tokenizer.decode(output_ids[0, input_ids.shape[1]:]).strip()
-                # print(outputs)
-                res.append(outputs)
-            df = pd.DataFrame({
-                'file': name,
-                'output': res
-            })
-            save_path = 'dataset/saved_result/test_res/{}.csv'.format(video_id_folder)
-            df.to_csv(save_path, index=False)
+    _evaluate_folder_dataset(
+        root_dir="dataset/Ucf/Ucfcrime_split",
+        pose_root="dataset/Ucf/pose_feat",
+        scene_root="dataset/Ucf",
+        save_root="dataset/saved_result/test_res",
+        prompt=UCF_PROMPT,
+        tokenizer=tokenizer,
+        model=model,
+        processor_dict=processor_dict,
+        is_qwen3_vl=is_qwen3_vl,
+        max_new_tokens=32,
+        skip_if_contains="Normal",
+    )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 
 import torch
+import torch.nn as nn
 
 import transformers
 
@@ -40,6 +41,7 @@ from llava import conversation as conversation_lib
 from llava.model import *
 from llava.model.language_model.qwen3_vl_hawkeye import load_pretrained_qwen3vl_hawkeye_model
 from llava.mm_utils import tokenizer_X_token
+from llava.train.qwen3vl_data import collate_qwen3vl_batch, preprocess_qwen3vl_visual
 
 from PIL import Image
 from tqdm import tqdm
@@ -61,21 +63,18 @@ def _strip_media_tokens(text: str) -> str:
     return re.sub(r"<\s*(video|image)\s*>", "", text, flags=re.IGNORECASE).strip()
 
 
-def _aux_stats_text(pose_feat: Optional[torch.Tensor], scene_feat: Optional[torch.Tensor]) -> str:
-    if pose_feat is None or scene_feat is None:
-        return ""
-
-    pose_feat = pose_feat.float()
-    scene_feat = scene_feat.float()
-    return (
-        f"pose_mean={pose_feat.mean().item():.4f}; pose_std={pose_feat.std().item():.4f}; "
-        f"scene_mean={scene_feat.mean().item():.4f}; scene_std={scene_feat.std().item():.4f}"
-    )
+def _resolve_scene_feature_path(base_dir: str, folder: str, filename: str) -> str:
+    graph_path = os.path.join(base_dir, 'graph_feat', 'train', folder, filename)
+    if os.path.exists(graph_path):
+        return graph_path
+    rel_path = os.path.join(base_dir, 'rel_feat', 'train', folder, filename)
+    return rel_path
 
 
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
+    model_base: Optional[str] = field(default=None)
     version: Optional[str] = field(default="v0")
     freeze_backbone: bool = field(default=False)
     tune_mm_mlp_adapter: bool = field(default=False)
@@ -205,6 +204,63 @@ def find_all_linear_names(model):
     if 'lm_head' in lora_module_names:  # needed for 16-bit
         lora_module_names.remove('lm_head')
     return list(lora_module_names)
+
+
+def find_qwen_lora_target_modules() -> List[str]:
+    return ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+
+def _set_qwen_hawkeye_modules_trainable(model: nn.Module) -> None:
+    for module_name in (
+        "pose_tower",
+        "pose_projector",
+        "scene_tower",
+        "scene_projector",
+        "moe",
+        "moe_projector",
+    ):
+        module = getattr(model, module_name, None)
+        if module is None and hasattr(model, "get_base_model"):
+            module = getattr(model.get_base_model(), module_name, None)
+        if module is None and hasattr(model, "base_model") and hasattr(model.base_model, "model"):
+            module = getattr(model.base_model.model, module_name, None)
+        if module is None:
+            continue
+        for parameter in module.parameters():
+            parameter.requires_grad = True
+
+
+def _save_qwen_hawkeye_metadata(
+    model: nn.Module,
+    tokenizer: transformers.PreTrainedTokenizer,
+    processor: Optional[Any],
+    output_dir: str,
+    model_base: Optional[str],
+) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    tokenizer.save_pretrained(output_dir)
+    if processor is not None and hasattr(processor, "save_pretrained"):
+        processor.save_pretrained(output_dir)
+
+    base_model = model
+    if hasattr(base_model, "get_base_model"):
+        base_model = base_model.get_base_model()
+    if hasattr(base_model, "base_model") and hasattr(base_model.base_model, "model"):
+        base_model = base_model.base_model.model
+
+    config = getattr(base_model, "config", None)
+    if config is not None:
+        setattr(config, "hawkeye_model_base", model_base)
+
+    hawkeye_config = {
+        "base_model_name_or_path": model_base,
+        "hawkeye_hidden_size": getattr(config, "hawkeye_hidden_size", None),
+        "hawkeye_scene_token_count": getattr(config, "hawkeye_scene_token_count", None),
+        "video_token_id": getattr(config, "video_token_id", None),
+        "image_token_id": getattr(config, "image_token_id", None),
+    }
+    with open(os.path.join(output_dir, "hawkeye_config.json"), "w", encoding="utf-8") as file:
+        json.dump(hawkeye_config, file, ensure_ascii=True, indent=2)
 
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
@@ -787,8 +843,8 @@ class LazySupervisedDataset(Dataset):
                 pose_feat = pose_feature_pad
 
                 scene_file = 'frame_{}.npy'.format(int(video_file.split('.')[0]))
-                scene_feature = torch.from_numpy(
-                    np.load(os.path.join('dataset/graph_feat/train/{}'.format(video_folder), scene_file)))
+                scene_path = _resolve_scene_feature_path('dataset', video_folder, scene_file)
+                scene_feature = torch.from_numpy(np.load(scene_path))
                 #print(scene_feature.shape,'olg694300scene')
                 if scene_feature.size(0) < 5:
                     padding_size = 5 - scene_feature.size(0)
@@ -860,6 +916,17 @@ class LazySupervisedDataset(Dataset):
             else:
                 sources_ = copy.deepcopy([e["conversations"] for e in sources])
 
+            if use_qwen_multimodal:
+                data_dict = preprocess_qwen3vl_visual(
+                    conversations=sources[0]["conversations"],
+                    processor=self.data_args.qwen_processor,
+                    media_path=media_path,
+                    media_type=media_type,
+                )
+                data_dict['pose_feat'] = pose_feat
+                data_dict['scene_feat'] = scene_feat
+                return data_dict
+
             data_dict = preprocess(
                 sources_,
                 self.tokenizer,
@@ -892,14 +959,6 @@ class LazySupervisedDataset(Dataset):
             data_dict['pose_feat'] = pose_feat
             data_dict['scene_feat'] = scene_feat
 
-            if use_qwen_multimodal:
-                user_text = sources[0]["conversations"][0]["value"]
-                assistant_text = sources[0]["conversations"][1]["value"]
-                data_dict['qwen_user_text'] = user_text
-                data_dict['qwen_assistant_text'] = assistant_text
-                data_dict['qwen_media_path'] = media_path
-                data_dict['qwen_media_type'] = media_type
-
             return data_dict
 
         except Exception as e:
@@ -923,78 +982,7 @@ class DataCollatorForSupervisedDataset(object):
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         if self.qwen_multimodal:
-            if self.qwen_processor is None:
-                raise ValueError("qwen_processor is required when qwen_multimodal=True")
-
-            encoded_batches = []
-            for instance in instances:
-                user_text = _strip_media_tokens(instance.get('qwen_user_text', ''))
-                aux_text = _aux_stats_text(instance.get('pose_feat'), instance.get('scene_feat'))
-                if aux_text:
-                    user_text = f"{user_text}\nAuxiliary scene stats: {aux_text}"
-
-                media_path = instance.get('qwen_media_path')
-                media_type = instance.get('qwen_media_type')
-                content = []
-                if media_path is not None:
-                    if media_type == 'image':
-                        content.append({'type': 'image', 'image': media_path})
-                    else:
-                        content.append({'type': 'video', 'video': media_path})
-                content.append({'type': 'text', 'text': user_text})
-
-                messages = [
-                    {'role': 'user', 'content': content},
-                    {'role': 'assistant', 'content': [{'type': 'text', 'text': instance.get('qwen_assistant_text', '')}]},
-                ]
-
-                encoded = self.qwen_processor.apply_chat_template(
-                    messages,
-                    tokenize=True,
-                    add_generation_prompt=False,
-                    return_dict=True,
-                    return_tensors='pt',
-                )
-                encoded_batches.append(encoded)
-
-            pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-            input_ids = torch.nn.utils.rnn.pad_sequence(
-                [x['input_ids'][0] for x in encoded_batches],
-                batch_first=True,
-                padding_value=pad_id,
-            )
-            attention_mask = torch.nn.utils.rnn.pad_sequence(
-                [x['attention_mask'][0] for x in encoded_batches],
-                batch_first=True,
-                padding_value=0,
-            )
-            labels = input_ids.clone()
-            labels[attention_mask == 0] = IGNORE_INDEX
-
-            batch = {
-                'input_ids': input_ids,
-                'attention_mask': attention_mask,
-                'labels': labels,
-            }
-
-            optional_keys = ['pixel_values', 'pixel_values_videos', 'image_grid_thw', 'video_grid_thw']
-            for key in optional_keys:
-                values = [x[key] for x in encoded_batches if key in x]
-                if not values:
-                    continue
-                if isinstance(values[0], torch.Tensor):
-                    batch[key] = torch.cat(values, dim=0)
-                else:
-                    batch[key] = values
-
-            pose_values = [instance.get('pose_feat') for instance in instances]
-            scene_values = [instance.get('scene_feat') for instance in instances]
-            if all(v is not None for v in pose_values):
-                batch['pose_values'] = torch.stack(pose_values)
-            if all(v is not None for v in scene_values):
-                batch['scene_values'] = torch.stack(scene_values)
-
-            return batch
+            return collate_qwen3vl_batch(instances, self.tokenizer)
 
         input_ids, labels = tuple([instance[key] for instance in instances]
                                   for key in ("input_ids", "labels"))
@@ -1068,7 +1056,7 @@ def train():
     # training_args.device = 'cpu'
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
-    is_qwen3_vl = _is_qwen3_vl_model_name(model_args.model_name_or_path)
+    is_qwen3_vl = _is_qwen3_vl_model_name(model_args.model_name_or_path) or _is_qwen3_vl_model_name(model_args.model_base)
 
     bnb_model_from_pretrained_args = {}
     if training_args.bits in [4, 8]:
@@ -1091,7 +1079,7 @@ def train():
     if is_qwen3_vl:
         tokenizer, model, processor_dict, _ = load_pretrained_qwen3vl_hawkeye_model(
             model_path=model_args.model_name_or_path,
-            model_base=None,
+            model_base=model_args.model_base,
             load_8bit=training_args.bits == 8,
             load_4bit=training_args.bits == 4,
             device_map="auto",
@@ -1151,7 +1139,7 @@ def train():
         lora_config = LoraConfig(
             r=training_args.lora_r,
             lora_alpha=training_args.lora_alpha,
-            target_modules=find_all_linear_names(model),
+            target_modules=find_qwen_lora_target_modules() if is_qwen3_vl else find_all_linear_names(model),
             lora_dropout=training_args.lora_dropout,
             bias=training_args.lora_bias,
             task_type="CAUSAL_LM",
@@ -1164,6 +1152,8 @@ def train():
                 model.to(torch.float16)
         rank0_print("Adding LoRA adapters...")
         model = get_peft_model(model, lora_config)
+        if is_qwen3_vl:
+            _set_qwen_hawkeye_modules_trainable(model)
         model.print_trainable_parameters()
 
     if is_qwen3_vl:
@@ -1353,9 +1343,25 @@ def train():
             model.config.save_pretrained(training_args.output_dir)
             model.save_pretrained(training_args.output_dir, state_dict=state_dict)
             torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, 'non_lora_trainables.bin'))
+            if is_qwen3_vl:
+                _save_qwen_hawkeye_metadata(
+                    model=model,
+                    tokenizer=tokenizer,
+                    processor=qwen_processor,
+                    output_dir=training_args.output_dir,
+                    model_base=model_args.model_base or model_args.model_name_or_path,
+                )
     else:
         safe_save_model_for_hf_trainer(trainer=trainer,
                                        output_dir=training_args.output_dir)
+        if is_qwen3_vl and (training_args.local_rank == 0 or training_args.local_rank == -1):
+            _save_qwen_hawkeye_metadata(
+                model=model,
+                tokenizer=tokenizer,
+                processor=qwen_processor,
+                output_dir=training_args.output_dir,
+                model_base=model_args.model_base or model_args.model_name_or_path,
+            )
 
 
 if __name__ == "__main__":

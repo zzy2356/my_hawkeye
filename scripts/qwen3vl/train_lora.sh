@@ -3,7 +3,8 @@ set -euo pipefail
 
 DATA_ROOT="dataset/vid_noaudio_split/train_new"
 IMAGE_ROOT="dataset"
-MODEL_PATH="models/Qwen3-VL-8B-Instruct"
+MODEL_PATH="${HAWKEYE_MODEL_PATH:-models/Qwen3-VL-8B-Instruct}"
+MODEL_BASE="${HAWKEYE_MODEL_BASE:-${MODEL_PATH}}"
 OUT_DIR="output_folder/Hawkeye-Qwen3VL"
 
 # Full training entry for Qwen3-VL + Hawkeye pipeline.
@@ -11,6 +12,7 @@ deepspeed --master_port=29501 train_mem.py \
   --deepspeed ./scripts/zero2.json \
   --lora_enable True \
   --model_name_or_path "${MODEL_PATH}" \
+  --model_base "${MODEL_BASE}" \
   --version v1 \
   --data_path dataset/new_train.json \
   --video_folder "${DATA_ROOT}" \
