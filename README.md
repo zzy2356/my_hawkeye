@@ -58,8 +58,18 @@ You can set up the environments by using `conda env create -f environment.yml`.
 ```
 
 ### Model checkpoint preparation
+Original Hawkeye route:
 1. Download the pretrained vicuna-v1.5 model from [Haggingface](https://huggingface.co/lmsys/vicuna-7b-v1.5/tree/main) and place it in the `lmsys` folder.
 2. Download the pretrained LanguageBind model from [LanguageBind](https://huggingface.co/LanguageBind) and place it in the `LanguageBind` folder.
+3. Keep the original Video-LLaVA projector checkpoint if you run the legacy `scripts/v1_5/*` pipeline.
+
+Qwen-Hawkeye migration route:
+1. Place `Qwen3-VL-8B-Instruct` under `models/`.
+2. Keep pose features under `dataset/pose_feat/...`.
+3. Keep scene features under either `dataset/graph_feat/...` or `dataset/rel_feat/...`.
+4. The old `Vicuna + LanguageBind + Video-LLaVA` stack is not required if you only run `scripts/qwen3vl/*`.
+
+See `QWEN3VL_MIGRATION_README.md` for the current migration status, workflow, and known gaps relative to the original paper code.
 
 ### Training
 ```commandline
