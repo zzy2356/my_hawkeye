@@ -256,6 +256,22 @@ This remains the reference implementation for the original paper path.
 
 ---
 
+## Video token organization isomorphism (占位符处「视频特征 + 场景增强 MoE」拼接)
+
+Both the LLaVA path and the Qwen3-VL path now implement the same semantic at the placeholder:
+
+- **LLaVA** (`llava_arch.prepare_inputs_labels_for_multimodal`):  
+  `cur_X_features = torch.cat((X_features_video[i], X_moe_feat), dim=0)` and replace the single VIDEO placeholder with this block. So the placeholder is **[video tokens] + [MoE tokens]**.
+
+- **Qwen3-VL** (`qwen3_vl_hawkeye._prepare_qwen_hawkeye_inputs`):  
+  1. `_materialize_qwen_multimodal_embeds` scatters **video embeddings** into positions where `input_ids == video_token_id`.  
+  2. `_splice_hawkeye_tokens` inserts **Hawkeye MoE token block** immediately after the last video token (`insert_at = spans[-1][1]`), so the sequence is `[...][video_embeds][moe_embeds][...]`.  
+  So the placeholder region is again **[video features] + [scene-enhanced MoE]**.
+
+Conclusion: the code **does** implement video token organization isomorphism: at the placeholder, both paths use the concatenation of video features and scene-enhanced MoE tokens, matching the original Hawkeye design.
+
+---
+
 ## Inference Entry Points
 
 ### Smoke inference
