@@ -1,0 +1,72 @@
+name: zyzhu_hk_qwen3vl
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - pip>=24.0
+  - setuptools>=69
+  - wheel
+  - ninja
+  - cmake
+  - git
+  - ffmpeg
+
+  # PyTorch stack (CUDA 12.4 build)
+  - pytorch=2.6.0
+  - torchvision=0.21.0
+  - torchaudio=2.6.0
+  - pytorch-cuda=12.4
+
+  - pip:
+      # Core HF stack required by current Qwen3-VL path
+      - "transformers>=4.57.0,<4.60.0"
+      - "tokenizers>=0.21.0,<0.22.0"
+      - "accelerate>=0.34.0,<1.0.0"
+      - "huggingface-hub>=0.34.0,<1.0.0"
+      - "safetensors>=0.5.0"
+      - "sentencepiece>=0.2.0"
+
+      # Training stack
+      - "deepspeed==0.17.1"
+      - "peft==0.17.1"
+      - "bitsandbytes>=0.45.0"
+
+      # Qwen3-VL multimodal utilities
+      - "qwen-vl-utils[decord]==0.0.14"
+      - "decord>=0.6.0"
+      - "av>=12.0.0"
+
+      # Hawkeye scene-enhancement deps
+      - "torch-geometric>=2.6.0"
+      - "fairscale>=0.4.13"
+
+      # Common runtime utilities used in project scripts
+      - "numpy>=1.26.0,<2.0.0"
+      - "pandas>=2.2.0"
+      - "pillow>=10.3.0"
+      - "scipy>=1.12.0"
+      - "scikit-learn>=1.4.0"
+      - "tqdm>=4.66.0"
+      - "opencv-python>=4.10.0"
+      - "einops>=0.8.0"
+      - "datasets>=3.0.0"
+      - "tensorboardx>=2.6.2"
+      - "packaging>=24.0"
+      - "pyyaml>=6.0.1"
+      - "transformers-stream-generator>=0.0.4"
+      - "requests>=2.32.0"
+
+      # Built-in serving stack from llava/serve
+      - "fastapi>=0.115.0,<1.0.0"
+      - "uvicorn>=0.30.0,<1.0.0"
+      - "gradio>=4.44.0,<5.0.0"
+      - "gradio-client>=1.3.0,<2.0.0"
+      - "httpx>=0.27.0,<1.0.0"
+
+      # Optional but recommended for faster attention kernels.
+      # If this fails to compile on server, keep it uninstalled and continue.
+      # - flash-attn==2.7.4.post1
