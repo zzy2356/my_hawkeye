@@ -147,6 +147,117 @@ class Qwen3VLHawkeyeAdapter(nn.Module):
     def resize_token_embeddings(self, *args, **kwargs):
         return self.model.resize_token_embeddings(*args, **kwargs)
 
+    def _get_visual_module(self) -> Optional[nn.Module]:
+        visual = getattr(self.model, "visual", None)
+        if visual is not None:
+            return visual
+        inner_model = getattr(self.model, "model", None)
+        return getattr(inner_model, "visual", None) if inner_model is not None else None
+
+    def _get_visual_dtype(self) -> torch.dtype:
+        visual = self._get_visual_module()
+        if visual is None:
+            return self.dtype
+        if hasattr(visual, "get_dtype"):
+            return visual.get_dtype()
+        try:
+            return next(visual.parameters()).dtype
+        except StopIteration:
+            return self.dtype
+
+    def _run_visual_encoder(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: Optional[torch.Tensor],
+        modality: str,
+    ) -> torch.Tensor:
+        visual = self._get_visual_module()
+        if visual is None:
+            raise ValueError("Qwen3-VL visual module is unavailable; cannot materialize visual embeddings.")
+
+        visual_inputs = pixel_values.to(device=self.device, dtype=self._get_visual_dtype())
+        if grid_thw is not None:
+            grid_thw = grid_thw.to(device=self.device)
+
+        for kwargs in (
+            {"grid_thw": grid_thw},
+            {f"{modality}_grid_thw": grid_thw},
+        ):
+            try:
+                return visual(visual_inputs, **kwargs)
+            except TypeError:
+                continue
+        try:
+            return visual(visual_inputs, grid_thw)
+        except TypeError:
+            return visual(visual_inputs)
+
+    @staticmethod
+    def _masked_scatter_multimodal_embeds(
+        inputs_embeds: torch.Tensor,
+        input_ids: torch.Tensor,
+        token_id: int,
+        multimodal_embeds: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if multimodal_embeds is None:
+            return inputs_embeds
+
+        token_mask = input_ids == token_id
+        token_count = int(token_mask.sum().item())
+        if token_count == 0:
+            return inputs_embeds
+
+        multimodal_embeds = multimodal_embeds.reshape(-1, inputs_embeds.shape[-1]).to(
+            device=inputs_embeds.device,
+            dtype=inputs_embeds.dtype,
+        )
+        if multimodal_embeds.shape[0] != token_count:
+            raise ValueError(
+                f"Mismatch between token count ({token_count}) and multimodal embeddings ({multimodal_embeds.shape[0]}) "
+                f"for token_id={token_id}."
+            )
+
+        expanded_mask = token_mask.unsqueeze(-1).expand_as(inputs_embeds)
+        return inputs_embeds.masked_scatter(expanded_mask, multimodal_embeds.reshape(-1))
+
+    def _materialize_qwen_multimodal_embeds(
+        self,
+        input_ids: torch.Tensor,
+        model_kwargs: Dict[str, Any],
+    ) -> Tuple[torch.Tensor, Dict[str, Any], bool]:
+        prepared_kwargs = dict(model_kwargs)
+        inputs_embeds = prepared_kwargs.pop("inputs_embeds", None)
+        if inputs_embeds is None:
+            inputs_embeds = self.get_input_embeddings()(input_ids)
+        else:
+            inputs_embeds = inputs_embeds.to(device=self.device, dtype=self.dtype)
+
+        pixel_values = prepared_kwargs.pop("pixel_values", None)
+        image_grid_thw = prepared_kwargs.pop("image_grid_thw", None)
+        pixel_values_videos = prepared_kwargs.pop("pixel_values_videos", None)
+        video_grid_thw = prepared_kwargs.pop("video_grid_thw", None)
+        has_visual_inputs = any(value is not None for value in (pixel_values, pixel_values_videos))
+
+        if pixel_values is not None:
+            image_embeds = self._run_visual_encoder(pixel_values, image_grid_thw, modality="image")
+            inputs_embeds = self._masked_scatter_multimodal_embeds(
+                inputs_embeds=inputs_embeds,
+                input_ids=input_ids,
+                token_id=self.image_token_id,
+                multimodal_embeds=image_embeds,
+            )
+
+        if pixel_values_videos is not None:
+            video_embeds = self._run_visual_encoder(pixel_values_videos, video_grid_thw, modality="video")
+            inputs_embeds = self._masked_scatter_multimodal_embeds(
+                inputs_embeds=inputs_embeds,
+                input_ids=input_ids,
+                token_id=self.video_token_id,
+                multimodal_embeds=video_embeds,
+            )
+
+        return inputs_embeds, prepared_kwargs, has_visual_inputs
+
     def encode_poses(self, pose_values: torch.Tensor) -> torch.Tensor:
         pose_tokens = self.pose_tower(pose_values.to(device=self.device, dtype=self.dtype))
         return self.pose_projector(pose_tokens)
@@ -215,18 +326,21 @@ class Qwen3VLHawkeyeAdapter(nn.Module):
     def _splice_hawkeye_tokens(
         self,
         input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
         labels: Optional[torch.Tensor],
         position_ids: Optional[torch.Tensor],
         hawkeye_tokens: List[Optional[torch.Tensor]],
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         batch_size = input_ids.shape[0]
         dummy_token_id = _resolve_dummy_token_id(self.config)
+        hidden_size = inputs_embeds.shape[-1]
 
         sample_payloads = []
         max_len = 0
         for batch_idx in range(batch_size):
             sample_input_ids = input_ids[batch_idx]
+            sample_input_embeds = inputs_embeds[batch_idx]
             sample_attention = (
                 attention_mask[batch_idx]
                 if attention_mask is not None
@@ -234,29 +348,29 @@ class Qwen3VLHawkeyeAdapter(nn.Module):
             )
             valid_len = int(sample_attention.long().sum().item())
             sample_input_ids = sample_input_ids[:valid_len]
+            sample_input_embeds = sample_input_embeds[:valid_len]
             sample_attention = sample_attention[:valid_len]
             sample_labels = labels[batch_idx, :valid_len] if labels is not None else None
             sample_position_ids = position_ids[:, batch_idx, :valid_len] if position_ids is not None else None
             sample_hawkeye = hawkeye_tokens[batch_idx]
 
             if sample_hawkeye is None:
-                insert_range = None
                 new_input_ids = sample_input_ids
+                new_input_embeds = sample_input_embeds
                 new_attention = sample_attention
                 new_labels = sample_labels
                 new_position_ids = sample_position_ids
             else:
                 spans = self._find_contiguous_spans(sample_input_ids, self.video_token_id)
                 if not spans:
-                    insert_range = None
                     new_input_ids = sample_input_ids
+                    new_input_embeds = sample_input_embeds
                     new_attention = sample_attention
                     new_labels = sample_labels
                     new_position_ids = sample_position_ids
                 else:
                     insert_at = spans[-1][1]
                     num_tokens = sample_hawkeye.shape[0]
-                    insert_range = (insert_at, insert_at + num_tokens)
                     dummy_ids = torch.full(
                         (num_tokens,),
                         dummy_token_id,
@@ -264,6 +378,11 @@ class Qwen3VLHawkeyeAdapter(nn.Module):
                         dtype=sample_input_ids.dtype,
                     )
                     new_input_ids = torch.cat([sample_input_ids[:insert_at], dummy_ids, sample_input_ids[insert_at:]], dim=0)
+                    hawkeye_embed_block = sample_hawkeye.to(device=sample_input_embeds.device, dtype=sample_input_embeds.dtype)
+                    new_input_embeds = torch.cat(
+                        [sample_input_embeds[:insert_at], hawkeye_embed_block, sample_input_embeds[insert_at:]],
+                        dim=0,
+                    )
                     new_attention = torch.cat(
                         [
                             sample_attention[:insert_at],
@@ -304,13 +423,18 @@ class Qwen3VLHawkeyeAdapter(nn.Module):
                         new_position_ids = None
 
             max_len = max(max_len, new_input_ids.shape[0])
-            sample_payloads.append((new_input_ids, new_attention, new_labels, new_position_ids, insert_range, sample_hawkeye))
+            sample_payloads.append((new_input_ids, new_input_embeds, new_attention, new_labels, new_position_ids))
 
         batch_input_ids = torch.full(
             (batch_size, max_len),
             dummy_token_id,
             device=input_ids.device,
             dtype=input_ids.dtype,
+        )
+        batch_inputs_embeds = torch.zeros(
+            (batch_size, max_len, hidden_size),
+            device=inputs_embeds.device,
+            dtype=inputs_embeds.dtype,
         )
         batch_attention = torch.zeros((batch_size, max_len), device=input_ids.device, dtype=torch.long)
         batch_labels = None
@@ -319,20 +443,18 @@ class Qwen3VLHawkeyeAdapter(nn.Module):
         batch_position_ids = None
         if position_ids is not None:
             batch_position_ids = torch.zeros((3, batch_size, max_len), device=input_ids.device, dtype=position_ids.dtype)
-        hawkeye_mask = torch.zeros((batch_size, max_len), device=input_ids.device, dtype=torch.bool)
 
-        for batch_idx, (sample_ids, sample_attention, sample_labels, sample_pos, insert_range, sample_hawkeye) in enumerate(sample_payloads):
+        for batch_idx, (sample_ids, sample_embeds, sample_attention, sample_labels, sample_pos) in enumerate(sample_payloads):
             seq_len = sample_ids.shape[0]
             batch_input_ids[batch_idx, :seq_len] = sample_ids
+            batch_inputs_embeds[batch_idx, :seq_len] = sample_embeds
             batch_attention[batch_idx, :seq_len] = sample_attention.long()
             if batch_labels is not None and sample_labels is not None:
                 batch_labels[batch_idx, :seq_len] = sample_labels
             if batch_position_ids is not None and sample_pos is not None:
                 batch_position_ids[:, batch_idx, :seq_len] = sample_pos
-            if insert_range is not None and sample_hawkeye is not None:
-                hawkeye_mask[batch_idx, insert_range[0]: insert_range[1]] = True
 
-        return batch_input_ids, batch_attention, batch_labels, batch_position_ids, hawkeye_mask
+        return batch_input_ids, batch_inputs_embeds, batch_attention, batch_labels, batch_position_ids
 
     def _prepare_qwen_hawkeye_inputs(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         model_kwargs = dict(kwargs)
@@ -349,36 +471,44 @@ class Qwen3VLHawkeyeAdapter(nn.Module):
         if input_ids is None:
             return model_kwargs
 
+        input_ids = input_ids.to(device=self.device)
         attention_mask = model_kwargs.get("attention_mask")
         labels = model_kwargs.get("labels")
         position_ids = model_kwargs.get("position_ids")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device=self.device)
+        if labels is not None:
+            labels = labels.to(device=self.device)
+        if position_ids is not None:
+            position_ids = position_ids.to(device=self.device)
+        inputs_embeds, model_kwargs, has_visual_inputs = self._materialize_qwen_multimodal_embeds(input_ids, model_kwargs)
         hawkeye_sequences = self._build_hawkeye_token_sequences(
             pose_values=pose_values,
             scene_values=scene_values,
             batch_size=input_ids.shape[0],
         )
+        has_hawkeye = any(sequence is not None for sequence in hawkeye_sequences)
+        if not has_visual_inputs and not has_hawkeye:
+            model_kwargs["input_ids"] = input_ids
+            if attention_mask is not None:
+                model_kwargs["attention_mask"] = attention_mask
+            if labels is not None:
+                model_kwargs["labels"] = labels
+            if position_ids is not None:
+                model_kwargs["position_ids"] = position_ids
+            return model_kwargs
 
-        new_input_ids, new_attention_mask, new_labels, new_position_ids, hawkeye_mask = self._splice_hawkeye_tokens(
+        new_input_ids, new_inputs_embeds, new_attention_mask, new_labels, new_position_ids = self._splice_hawkeye_tokens(
             input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             labels=labels,
             position_ids=position_ids,
             hawkeye_tokens=hawkeye_sequences,
         )
-        inputs_embeds = self.get_input_embeddings()(new_input_ids)
-        for batch_idx, hawkeye_tokens in enumerate(hawkeye_sequences):
-            if hawkeye_tokens is None:
-                continue
-            insert_positions = torch.where(hawkeye_mask[batch_idx])[0]
-            if insert_positions.numel() != hawkeye_tokens.shape[0]:
-                continue
-            inputs_embeds[batch_idx, insert_positions] = hawkeye_tokens.to(
-                device=inputs_embeds.device,
-                dtype=inputs_embeds.dtype,
-            )
 
         model_kwargs["input_ids"] = new_input_ids
-        model_kwargs["inputs_embeds"] = inputs_embeds
+        model_kwargs["inputs_embeds"] = new_inputs_embeds
         model_kwargs["attention_mask"] = new_attention_mask
         if new_labels is not None:
             model_kwargs["labels"] = new_labels
