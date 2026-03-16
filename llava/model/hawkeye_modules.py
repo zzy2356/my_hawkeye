@@ -1,3 +1,5 @@
+from typing import Any, Dict, Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -193,6 +195,8 @@ class HawkeyeMoE(nn.Module):
             nn.Linear(hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
         )
+        self.last_routing_weights: Optional[torch.Tensor] = None
+        self.last_debug: Dict[str, Any] = {}
 
     def _resize_sequence(self, x: torch.Tensor) -> torch.Tensor:
         if x.size(1) == self.scene_token_count:
@@ -208,16 +212,40 @@ class HawkeyeMoE(nn.Module):
         if scene_feat.ndim == 2:
             scene_feat = scene_feat.unsqueeze(0)
         fused = torch.cat((pose_feat, scene_feat), dim=1)
+        # Resize fused sequence to scene_token_count BEFORE computing routing
+        # weights so that routing_weights and expert_hidden share the same
+        # token dimension and the broadcast in (expert_hidden * expert_weight)
+        # does not raise a size mismatch.
+        fused = self._resize_sequence(fused)
+        # routing_weights: (B, scene_token_count, num_experts)
         routing_weights = torch.softmax(self.routers(fused), dim=-1)
+        self.last_routing_weights = routing_weights.detach().float().cpu()
         expert_outputs = []
         for expert_id, blocks in enumerate(self.experts):
             expert_hidden = fused
             for block in blocks:
                 expert_hidden = block(expert_hidden)
-            expert_hidden = self._resize_sequence(expert_hidden)
-            expert_weight = routing_weights[:, :self.scene_token_count, expert_id].unsqueeze(-1)
+            # expert_hidden is already scene_token_count tokens; no resize needed.
+            expert_weight = routing_weights[:, :, expert_id].unsqueeze(-1)  # (B, scene_token_count, 1)
             expert_outputs.append(expert_hidden * expert_weight)
-        return self.out_proj(sum(expert_outputs))
+        output = self.out_proj(sum(expert_outputs))
+        dominant_experts = routing_weights.argmax(dim=-1)
+        expert_token_counts = [
+            int((dominant_experts == expert_id).sum().item()) for expert_id in range(self.num_experts)
+        ]
+        entropy = -(routing_weights * routing_weights.clamp_min(1e-8).log()).sum(dim=-1)
+        preview_len = min(8, routing_weights.shape[1])
+        self.last_debug = {
+            "fused_shape": list(fused.shape),
+            "routing_weights_shape": list(routing_weights.shape),
+            "routing_weight_means": routing_weights.mean(dim=(0, 1)).detach().float().cpu().tolist(),
+            "routing_weight_max": routing_weights.amax(dim=(0, 1)).detach().float().cpu().tolist(),
+            "routing_entropy_mean": float(entropy.mean().detach().cpu().item()),
+            "dominant_expert_counts": expert_token_counts,
+            "routing_preview": routing_weights[0, :preview_len].detach().float().cpu().tolist(),
+            "output_shape": list(output.shape),
+        }
+        return output
 
 
 def build_pose_tower(hidden_size: int, pose_dim: int = 85) -> PoseTower:

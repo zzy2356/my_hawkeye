@@ -20,7 +20,11 @@ import json
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, BitsAndBytesConfig
 import torch
-from llava.model import *
+# NOTE: Do NOT do "from llava.model import *" here.
+# That wildcard import pulls in LlavaLlamaForCausalLM -> llava_arch -> LanguageBind,
+# which depends on transformers internals removed in transformers >= 4.36.
+# LLaVA classes are imported lazily inside the LLaVA branch below so that the
+# Qwen3-VL path never touches LanguageBind at all.
 from llava.constants import DEFAULT_X_PATCH_TOKEN, DEFAULT_X_START_TOKEN, DEFAULT_X_END_TOKEN
 from llava.model.language_model.qwen3_vl_hawkeye import load_pretrained_qwen3vl_hawkeye_model
 
@@ -79,6 +83,10 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         )
 
     if 'llava' in model_name.lower() or 'hawkeye' in model_name.lower():
+        # Lazy import: only load LLaVA/LanguageBind classes when actually needed.
+        # This keeps the Qwen3-VL path free of the old-transformers dependency.
+        from llava.model.language_model.llava_llama import LlavaLlamaForCausalLM  # noqa: F401
+        from llava.model.language_model.llava_mpt import LlavaMPTForCausalLM    # noqa: F401
         # Load LLaVA model
         if 'lora' in model_name.lower() and model_base is None:
             warnings.warn('There is `lora` in model name but no `model_base` is provided. If you are loading a LoRA model, please provide the `model_base` argument. Detailed instruction: https://github.com/haotian-liu/LLaVA#launch-a-model-worker-lora-weights-unmerged.')
@@ -141,14 +149,6 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 model = LlavaMPTForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
             else:
                 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-                # config = AutoConfig.from_pretrained(model_path)
-                # model1 = LlavaLlamaForCausalLM(config)
-                # a = torch.load(rf'{model_path}/pytorch_model-00001-of-00003.bin')
-                # b = torch.load(rf'{model_path}/pytorch_model-00002-of-00003.bin')
-                # c = torch.load(rf'{model_path}/pytorch_model-00003-of-00003.bin')
-                # model1.load_state_dict(a, strict=False)
-                # model1.load_state_dict(b, strict=False)
-                # model1.load_state_dict(c, strict=False)
                 model = LlavaLlamaForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
                 print()
     else:
@@ -185,7 +185,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             for x in X:
                 tokenizer.add_tokens([DEFAULT_X_START_TOKEN[x.upper()], DEFAULT_X_END_TOKEN[x.upper()]], special_tokens=True)
         model.resize_token_embeddings(len(tokenizer))
-        print(X)    
+        print(X)
         if 'Image' in X:
             image_tower = model.get_image_tower()
             if not image_tower.is_loaded:
@@ -209,4 +209,3 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         context_len = 2048
 
     return tokenizer, model, processor, context_len
-    # return tokenizer, model1, processor, context_len

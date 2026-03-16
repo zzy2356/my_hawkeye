@@ -117,7 +117,13 @@ def _run_qwen3_vl_inference(
             do_sample=False,
         )
 
-    trimmed_ids = [output_ids[input_len:] for output_ids in generated_ids]
+    # Use the true prefix length stored by Qwen3VLHawkeyeAdapter.generate.
+    # _splice_hawkeye_tokens inserts MoE tokens into the sequence, making the
+    # real prefix longer than the original input_ids.  Using input_len here
+    # would leave MoE dummy tokens in the decoded output (visible as garbage
+    # characters like "!!!" before the answer).
+    true_prefix_lens = getattr(model, "last_prefix_lens", None) or [getattr(model, "last_prefix_len", None) or input_len]
+    trimmed_ids = [output_ids[prefix_len:] for output_ids, prefix_len in zip(generated_ids, true_prefix_lens)]
     outputs = processor.batch_decode(trimmed_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
     return outputs[0].strip() if outputs else ""
 

@@ -1,5 +1,14 @@
 import argparse
+import json
 import os
+import sys
+
+# Ensure the project root (two levels up from scripts/qwen3vl/) is on sys.path
+# so that the `llava` package can be imported regardless of cwd.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(_SCRIPT_DIR))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 import numpy as np
 import torch
@@ -108,8 +117,18 @@ def main() -> None:
             do_sample=False,
         )
 
-    trimmed = [out[input_len:] for out in output_ids]
+    # Use the true prefix length stored by Qwen3VLHawkeyeAdapter.generate.
+    # After _splice_hawkeye_tokens the sequence is longer than the original
+    # input_ids (MoE tokens were inserted), so we must NOT use input_len here.
+    true_prefix_lens = getattr(model, "last_prefix_lens", None) or [getattr(model, "last_prefix_len", None) or input_len]
+    trimmed = [out[prefix_len:] for out, prefix_len in zip(output_ids, true_prefix_lens)]
     text = qwen_processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+
+    if args.print_shapes:
+        print("=== Hawkeye Debug Info ===")
+        print(f"true_prefix_lens: {true_prefix_lens}")
+        debug_info = getattr(model, "last_debug_info", {})
+        print(json.dumps(debug_info, ensure_ascii=False, indent=2))
 
     print("=== Smoke Inference Output ===")
     print(text[0] if text else "")
