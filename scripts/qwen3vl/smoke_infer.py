@@ -51,6 +51,11 @@ def _model_device(model) -> torch.device:
     return getattr(model, "device", next(model.parameters()).device)
 
 
+def _device_map(model):
+    base_model = getattr(model, "model", model)
+    return getattr(base_model, "hf_device_map", None)
+
+
 def main() -> None:
     args = build_parser().parse_args()
 
@@ -99,6 +104,9 @@ def main() -> None:
 
     if args.print_shapes:
         print("=== Hawkeye Multimodal Shapes ===")
+        print(f"torch.cuda.is_available: {torch.cuda.is_available()}")
+        print(f"model_device: {_model_device(model)}")
+        print(f"hf_device_map: {_device_map(model)}")
         print(f"input_ids: {tuple(inputs['input_ids'].shape)}")
         if "pixel_values_videos" in inputs:
             print(f"pixel_values_videos: {tuple(inputs['pixel_values_videos'].shape)}")

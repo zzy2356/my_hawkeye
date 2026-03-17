@@ -51,7 +51,11 @@ def _model_device(model) -> torch.device:
 
 def _resolve_scene_feature_path(base_dir: str, folder: str, filename: str) -> str:
     resolved = _pick_existing_path(
+        os.path.join(base_dir, "graph_feat", "test", folder, filename),
+        os.path.join(base_dir, "graph_feat", "train", folder, filename),
         os.path.join(base_dir, "graph_feat", folder, filename),
+        os.path.join(base_dir, "rel_feat", "test", folder, filename),
+        os.path.join(base_dir, "rel_feat", "train", folder, filename),
         os.path.join(base_dir, "rel_feat", folder, filename),
     )
     if resolved is None:

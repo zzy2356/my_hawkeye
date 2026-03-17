@@ -67,7 +67,15 @@ def _resolve_scene_feature_path(base_dir: str, folder: str, filename: str) -> st
     graph_path = os.path.join(base_dir, 'graph_feat', 'train', folder, filename)
     if os.path.exists(graph_path):
         return graph_path
+    graph_flat_path = os.path.join(base_dir, 'graph_feat', folder, filename)
+    if os.path.exists(graph_flat_path):
+        return graph_flat_path
     rel_path = os.path.join(base_dir, 'rel_feat', 'train', folder, filename)
+    if os.path.exists(rel_path):
+        return rel_path
+    rel_flat_path = os.path.join(base_dir, 'rel_feat', folder, filename)
+    if os.path.exists(rel_flat_path):
+        return rel_flat_path
     return rel_path
 
 
