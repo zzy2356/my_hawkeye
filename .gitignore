@@ -1,4 +1,9 @@
 ﻿models/
+RelTR/
 __pycache__/
+HigherHRNet-Human-Pose-Estimation/
+dataset/
 *.pyc
 *.pyo
+.vscode/
+.venv/

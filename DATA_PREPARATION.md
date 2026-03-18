@@ -242,7 +242,7 @@ cd RelTR
 pip install -r requirements.txt
 
 # 下载预训练模型
-# 按照官方指南下载模型
+# 按照官方指南下载模型 checkpoint0149.pth
 ```
 
 #### 提取场景特征
@@ -290,7 +290,7 @@ output_dir = "dataset/rel_feat"
 os.makedirs(output_dir, exist_ok=True)
 
 # 加载模型
-model = load_reltr_model("path/to/reltr_model.pth")
+model = load_reltr_model("path/to/checkpoint0149.pth")
 
 for folder in os.listdir(video_dir):
     folder_path = os.path.join(video_dir, folder)
