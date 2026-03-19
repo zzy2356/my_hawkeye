@@ -193,10 +193,14 @@ load_pretrained_qwen3vl_hawkeye_model(model_path, model_base, …)
   ├─ AutoTokenizer.from_pretrained(tokenizer_source)
   ├─ AutoProcessor.from_pretrained(processor_source)
   ├─ AutoModelForImageTextToText.from_pretrained(backbone_path, torch_dtype=bfloat16)
+  │    (cache_dir from HAWKEYE_CACHE_DIR env var if set, else HF default)
   ├─ wrap in Qwen3VLHawkeyeAdapter(backbone_model, processor)
   │
-  ├─ if non_lora_trainables.bin exists:
-  │    load_state_dict(non_lora_trainables, strict=False)   ← restore Hawkeye modules
+  ├─ if non_lora_trainables.bin exists:           ← end-of-training Hawkeye weights
+  │    load_state_dict(non_lora_trainables, strict=False)
+  │
+  ├─ if hawkeye_non_lora.bin exists:              ← intermediate checkpoint Hawkeye weights
+  │    load_state_dict(hawkeye_non_lora, strict=False)
   │
   ├─ if adapter_config.json exists:
   │    PeftModel.from_pretrained → merge_and_unload          ← apply LoRA weights
@@ -222,7 +226,8 @@ llava/train/train.py::train()
   ├─ [Qwen3-VL branch]
   │    ├─ load_pretrained_qwen3vl_hawkeye_model(model_path, …)
   │    ├─ LoRA via peft.get_peft_model
-  │    │    target_modules: ["q_proj","k_proj","v_proj","o_proj"]
+  │    │    target_modules: ["q_proj","k_proj","v_proj","o_proj",
+  │    │                     "gate_proj","up_proj","down_proj"]
   │    ├─ _set_qwen_hawkeye_modules_trainable(model)
   │    │    (Hawkeye sub-modules always trained even under LoRA)
   │    └─ data_args.qwen_multimodal = True
@@ -243,7 +248,7 @@ llava/train/train.py::train()
   │         cats pixel_values_videos / video_grid_thw
   │         stacks pose_values / scene_values
   │
-  └─ LLaVATrainer.train()
+  └─ Qwen3VLHawkeyeTrainer.train()       ← used for Qwen3-VL path
        ├─ batch contains pose_values, scene_values → passed to model.forward()
        ├─ model.forward() runs the full adapter pipeline
        └─ deepspeed ZeRO-2 + gradient checkpointing + LoRA
@@ -251,15 +256,23 @@ llava/train/train.py::train()
 
 ### 4.2 Checkpoint saving
 
-After training, the output directory contains:
+After training completes, the output directory contains:
 
 | File | Content |
 |------|---------|
 | `adapter_model.safetensors` | LoRA delta weights |
 | `adapter_config.json` | LoRA configuration |
-| `non_lora_trainables.bin` | Hawkeye modules (pose/scene/moe towers) |
+| `non_lora_trainables.bin` | Hawkeye modules (pose/scene/moe towers) saved at end of training |
 | `hawkeye_config.json` | Adapter config snapshot |
 | `tokenizer_config.json` | Tokenizer files |
+
+Intermediate `checkpoint-N/` directories (written at `save_steps`) additionally contain:
+
+| File | Content |
+|------|---------|
+| `hawkeye_non_lora.bin` | Hawkeye module states at step N (written by `Qwen3VLHawkeyeTrainer`) |
+
+This ensures Hawkeye sub-module weights are never lost when resuming training from an intermediate checkpoint.
 
 ---
 
@@ -325,13 +338,14 @@ via `_ensure_hawkeye_modules_dtype()` to prevent mixed-dtype matmul errors.
 
 ```
 Trainable under LoRA:
-  Qwen3-VL attention: q_proj, k_proj, v_proj, o_proj
-  Hawkeye sub-modules (always unfrozen): pose_tower, pose_projector,
-                                         scene_tower, scene_projector,
-                                         moe, moe_projector
+  Qwen3-VL attention:    q_proj, k_proj, v_proj, o_proj
+  Qwen3-VL MLP:          gate_proj, up_proj, down_proj
+  Hawkeye sub-modules (always unfrozen via _set_qwen_hawkeye_modules_trainable):
+                         pose_tower, pose_projector,
+                         scene_tower, scene_projector,
+                         moe, moe_projector
 Frozen:
   Qwen3-VL ViT (visual encoder)
-  Qwen3-VL MLP feed-forward layers
   Embedding table
 ```
 
@@ -355,6 +369,8 @@ contribute to the SFT cross-entropy loss.
 my_hawkeye/
 ├── train_mem.py                              ← training entry point
 ├── eval.py                                   ← evaluation entry point
+├── requirements.txt                          ← main pip dependencies (Qwen3VL-first)
+├── environment.qwen3vl.yml                   ← conda environment spec
 ├── llava/
 │   ├── model/
 │   │   ├── builder.py                        ← load_pretrained_model dispatcher
@@ -363,7 +379,7 @@ my_hawkeye/
 │   │       └── qwen3_vl_hawkeye.py           ← Qwen3VLHawkeyeAdapter (core)
 │   └── train/
 │       ├── train.py                          ← training loop + LazySupervisedDataset
-│       ├── llava_trainer.py                  ← custom HF Trainer
+│       ├── llava_trainer.py                  ← LLaVATrainer + Qwen3VLHawkeyeTrainer
 │       └── qwen3vl_data.py                   ← preprocess_qwen3vl_visual, collate_qwen3vl_batch
 ├── scripts/
 │   └── qwen3vl/
