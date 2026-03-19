@@ -54,10 +54,10 @@ def _is_qwen3_vl_model(model_name, model_path=None, model_base=None):
 
 
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda"):
-    kwargs = {"device_map": device_map,
-              # "offload_folder": model_path,
-              "cache_dir": r'./'
-              }
+    cache_dir = os.environ.get("HAWKEYE_CACHE_DIR", None)
+    kwargs = {"device_map": device_map}
+    if cache_dir is not None:
+        kwargs["cache_dir"] = cache_dir
 
     if load_8bit:
         kwargs['load_in_8bit'] = True

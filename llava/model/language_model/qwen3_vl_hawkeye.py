@@ -702,9 +702,12 @@ def load_pretrained_qwen3vl_hawkeye_model(
 ) -> Tuple[Any, Qwen3VLHawkeyeAdapter, Dict[str, Any], int]:
     kwargs: Dict[str, Any] = {
         "device_map": device_map,
-        "cache_dir": r"./",
         "trust_remote_code": True,
     }
+
+    cache_dir = os.environ.get("HAWKEYE_CACHE_DIR", None)
+    if cache_dir is not None:
+        kwargs["cache_dir"] = cache_dir
 
     if load_8bit:
         kwargs["load_in_8bit"] = True
@@ -775,6 +778,13 @@ def load_pretrained_qwen3vl_hawkeye_model(
         non_lora_trainables = torch.load(non_lora_path, map_location="cpu")
         non_lora_trainables = _strip_state_dict_prefixes(non_lora_trainables)
         model.load_state_dict(non_lora_trainables, strict=False)
+
+    # Also load intermediate-checkpoint Hawkeye module states if present.
+    hawkeye_non_lora_path = os.path.join(model_path, "hawkeye_non_lora.bin")
+    if os.path.exists(hawkeye_non_lora_path):
+        hawkeye_trainables = torch.load(hawkeye_non_lora_path, map_location="cpu")
+        hawkeye_trainables = _strip_state_dict_prefixes(hawkeye_trainables)
+        model.load_state_dict(hawkeye_trainables, strict=False)
 
     adapter_config_path = os.path.join(model_path, "adapter_config.json")
     if os.path.exists(adapter_config_path):

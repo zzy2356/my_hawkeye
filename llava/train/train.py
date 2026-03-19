@@ -35,7 +35,7 @@ from llava.constants import IGNORE_INDEX, X_TOKEN_INDEX, DEFAULT_X_TOKEN, DEFAUL
 from torch.utils.data import Dataset
 from llava.conversation import conv_templates, SeparatorStyle
 from llava.mm_utils import tokenizer_X_token, get_model_name_from_path, KeywordsStoppingCriteria
-from llava.train.llava_trainer import LLaVATrainer
+from llava.train.llava_trainer import LLaVATrainer, Qwen3VLHawkeyeTrainer
 
 from llava import conversation as conversation_lib
 from llava.model import *
@@ -215,7 +215,7 @@ def find_all_linear_names(model):
 
 
 def find_qwen_lora_target_modules() -> List[str]:
-    return ["q_proj", "k_proj", "v_proj", "o_proj"]
+    return ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 
 def _set_qwen_hawkeye_modules_trainable(model: nn.Module) -> None:
@@ -1327,10 +1327,11 @@ def train():
     # print(model.device)
     #################
 
-    trainer = LLaVATrainer(model=model,
-                           tokenizer=tokenizer,
-                           args=training_args,
-                           **data_module)
+    trainer_cls = Qwen3VLHawkeyeTrainer if is_qwen3_vl else LLaVATrainer
+    trainer = trainer_cls(model=model,
+                          tokenizer=tokenizer,
+                          args=training_args,
+                          **data_module)
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
