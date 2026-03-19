@@ -2,7 +2,6 @@ from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch_geometric.nn as gnn
 from torch_geometric.data import Data
 from torch_geometric.nn import MessagePassing
@@ -136,7 +135,11 @@ class SceneGraphTower(nn.Module):
         x, edge_index, edge_attr = graph.x, graph.edge_index, graph.edge_attr
         for layer in self.conv_layers:
             x = layer(x, edge_index, edge_attr)
-            x = F.gelu(x)
+        # global_mean_pool with per-node batch indices preserves the original GTN
+        # structure (gnn.global_mean_pool(x, arange(N)) is identity-like, each
+        # node is its own "graph", so no aggregation occurs — output shape stays
+        # (num_nodes, hidden_size) matching the original GTN.forward behaviour).
+        x = gnn.global_mean_pool(x, torch.arange(0, x.size(0), dtype=torch.long, device=x.device))
         return self.output_proj(x)
 
 
@@ -212,21 +215,20 @@ class HawkeyeMoE(nn.Module):
         if scene_feat.ndim == 2:
             scene_feat = scene_feat.unsqueeze(0)
         fused = torch.cat((pose_feat, scene_feat), dim=1)
-        # Resize fused sequence to scene_token_count BEFORE computing routing
-        # weights so that routing_weights and expert_hidden share the same
-        # token dimension and the broadcast in (expert_hidden * expert_weight)
-        # does not raise a size mismatch.
-        fused = self._resize_sequence(fused)
-        # routing_weights: (B, scene_token_count, num_experts)
-        routing_weights = torch.softmax(self.routers(fused), dim=-1)
+        # Original routing: sigmoid + L1 normalisation (NOT softmax).
+        # routing_weights: (B, T, num_experts) where T = pose_tokens + scene_tokens
+        routing_weights = self.routers(fused).sigmoid()
+        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
         self.last_routing_weights = routing_weights.detach().float().cpu()
         expert_outputs = []
         for expert_id, blocks in enumerate(self.experts):
             expert_hidden = fused
             for block in blocks:
                 expert_hidden = block(expert_hidden)
-            # expert_hidden is already scene_token_count tokens; no resize needed.
-            expert_weight = routing_weights[:, :, expert_id].unsqueeze(-1)  # (B, scene_token_count, 1)
+            # Clip to scene_token_count AFTER expert processing — matches
+            # original MOE which truncates post-resampler, not pre-routing.
+            expert_hidden = expert_hidden[:, :self.scene_token_count]
+            expert_weight = routing_weights[:, :self.scene_token_count, expert_id].unsqueeze(-1)
             expert_outputs.append(expert_hidden * expert_weight)
         output = self.out_proj(sum(expert_outputs))
         dominant_experts = routing_weights.argmax(dim=-1)
