@@ -116,4 +116,91 @@ You can evaluate the model by running the command below.
 python3 eval.py
 ```
 
+## Work Archive (2026-03-18)
+
+This section records the data-prep migration and extraction status in this workspace.
+
+### What was done
+
+1. Keep `dataset/new_train.json` unchanged as the source-of-truth.
+2. Add clip materialization script that follows JSON paths and supports both datasets:
+     - `scripts/materialize_clips_from_new_train.py`
+     - source search order: `dataset/TSL-300/vid/train/*` and `dataset/UCF-Crime/<Class>/*`
+3. Add/upgrade real feature extraction scripts:
+     - `scripts/extract_pose_hrnet.py` (HigherHRNet)
+     - `scripts/extract_scene_reltr.py` (RelTR)
+4. Fix a pose parsing issue for mixed output shapes from HigherHRNet parser.
+5. Add resumable progress state for pose extraction:
+     - default state file: `<output-root>/_resume_pose.json`
+     - custom state file supported via `--resume-state`
+6. Batch defaults are now set to `24` for both pose and scene scripts.
+
+### Current status snapshot (real workspace state)
+
+- Clip materialization for `new_train.json`: complete (`missing_source_videos=0` in latest full run).
+- Pose extraction is running in background (observed process exists during latest check).
+- Latest observed counters at check time:
+    - `dataset/pose_feat/train/*/frame_*.npy`: `2603`
+    - `dataset/rel_feat/train/*/frame_*.npy`: `1`
+    - pose resume state file exists: `dataset/pose_feat/train_resume_state.json`
+    - last observed `next_task_index`: `2603`
+
+Note: these counters are time-sensitive and will increase while extraction keeps running.
+
+### Commands used in this workspace
+
+#### 1) Materialize clips from JSON paths
+
+```powershell
+$env:PATH="G:\project_space\my_hawkeye\Hawkeye\_bin;" + $env:PATH
+& "D:\anaconda3\envs\qwen3vl\python.exe" scripts/materialize_clips_from_new_train.py `
+    --json-path dataset/new_train.json `
+    --tsl-root dataset/TSL-300 `
+    --ucf-root dataset/UCF-Crime `
+    --output-root dataset/vid_noaudio_split/train_new
+```
+
+#### 2) Pose extraction (quality-preserving, resumable, batch=24 default)
+
+```powershell
+$env:PYTHONPATH="G:\project_space\my_hawkeye\Hawkeye\_pydeps"
+& "D:\anaconda3\envs\qwen3vl\python.exe" scripts/extract_pose_hrnet.py `
+    --json-path dataset/new_train.json `
+    --video-root dataset/vid_noaudio_split/train_new `
+    --output-root dataset/pose_feat/train `
+    --hrnet-root HigherHRNet-Human-Pose-Estimation `
+    --hrnet-cfg HigherHRNet-Human-Pose-Estimation/experiments/coco/higher_hrnet/w32_512_adam_lr1e-3.yaml `
+    --hrnet-ckpt HigherHRNet-Human-Pose-Estimation/pose_higher_hrnet_w32_512.pth `
+    --device cuda `
+    --batch-size 24 `
+    --resume-state dataset/pose_feat/train_resume_state.json
+```
+
+Resume after interruption: run the same command again.
+
+Force restart from beginning:
+
+```powershell
+... scripts/extract_pose_hrnet.py ... --reset-resume
+```
+
+#### 3) Scene extraction (batch=24 default)
+
+```powershell
+& "D:\anaconda3\envs\qwen3vl\python.exe" scripts/extract_scene_reltr.py `
+    --json-path dataset/new_train.json `
+    --video-root dataset/vid_noaudio_split/train_new `
+    --output-root dataset/rel_feat/train `
+    --reltr-root RelTR `
+    --reltr-ckpt RelTR/checkpoint0149.pth `
+    --device cuda `
+    --batch-size 24
+```
+
+### Verification helpers
+
+```powershell
+python -c "import glob; print('pose', len(glob.glob('dataset/pose_feat/train/*/frame_*.npy'))); print('scene', len(glob.glob('dataset/rel_feat/train/*/frame_*.npy')))"
+```
+
 

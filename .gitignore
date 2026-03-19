@@ -7,3 +7,4 @@ dataset/
 *.pyo
 .vscode/
 .venv/
+.vs/

@@ -12,6 +12,11 @@ import torchvision.transforms as T
 from PIL import Image
 
 
+def is_cuda_oom_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "out of memory" in msg or "cuda error" in msg
+
+
 def add_reltr_path(reltr_root: str):
     if reltr_root not in sys.path:
         sys.path.insert(0, reltr_root)
@@ -107,6 +112,63 @@ def reltr_feature_353(frame_bgr, model, transform, device, threshold: float):
     return feat.detach().cpu().numpy().astype(np.float32)
 
 
+def reltr_feature_batch_353(frames_bgr, model, transform, device, threshold: float):
+    if not frames_bgr:
+        return []
+
+    tensors = []
+    for frame_bgr in frames_bgr:
+        image = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(image)
+        tensors.append(transform(pil_image))
+    img_tensor = torch.stack(tensors, dim=0).to(device)
+
+    with torch.no_grad():
+        outputs = model(img_tensor)
+
+    rel_probs_all = outputs["rel_logits"].softmax(-1)[:, :, :-1]
+    sub_probs_all = outputs["sub_logits"].softmax(-1)[:, :, :-1]
+    obj_probs_all = outputs["obj_logits"].softmax(-1)[:, :, :-1]
+
+    feats = []
+    batch_size = rel_probs_all.shape[0]
+    for b in range(batch_size):
+        rel_probs = rel_probs_all[b]
+        sub_probs = sub_probs_all[b]
+        obj_probs = obj_probs_all[b]
+
+        keep = torch.logical_and(
+            rel_probs.max(-1).values > threshold,
+            torch.logical_and(
+                sub_probs.max(-1).values > threshold,
+                obj_probs.max(-1).values > threshold,
+            ),
+        )
+
+        if keep.sum().item() == 0:
+            feats.append(np.zeros((353,), dtype=np.float32))
+            continue
+
+        keep_idx = torch.nonzero(keep, as_tuple=True)[0]
+        score = (
+            rel_probs[keep_idx].max(-1).values
+            * sub_probs[keep_idx].max(-1).values
+            * obj_probs[keep_idx].max(-1).values
+        )
+        best_query = keep_idx[torch.argmax(score)].item()
+        feat = torch.cat(
+            [
+                sub_probs[best_query],
+                obj_probs[best_query],
+                rel_probs[best_query],
+            ],
+            dim=0,
+        )
+        feats.append(feat.detach().cpu().numpy().astype(np.float32))
+
+    return feats
+
+
 def sample_frames(video_path: str, num_frames: int):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -137,6 +199,7 @@ def main():
     parser.add_argument("--reltr-ckpt", type=str, required=True)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--num-frames", type=int, default=5)
+    parser.add_argument("--batch-size", type=int, default=24, help="Batch size for frame inference")
     parser.add_argument("--threshold", type=float, default=0.3)
     parser.add_argument("--max-folders", type=int, default=0)
     parser.add_argument("--max-clips", type=int, default=0, help="Process first N clips per folder, 0=all")
@@ -152,6 +215,9 @@ def main():
         folders = folders[: args.max_folders]
 
     model, transform = build_reltr(args.reltr_root, args.reltr_ckpt, args.device)
+
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be >= 1")
 
     done = 0
     miss_video = 0
@@ -176,8 +242,28 @@ def main():
             try:
                 frames = sample_frames(video_path, args.num_frames)
                 feat = np.zeros((args.num_frames, 353), dtype=np.float32)
-                for i, frame in enumerate(frames[: args.num_frames]):
-                    feat[i] = reltr_feature_353(frame, model, transform, args.device, args.threshold)
+                valid_frames = frames[: args.num_frames]
+                write_index = 0
+                start = 0
+                current_bs = min(args.batch_size, max(1, len(valid_frames)))
+                while start < len(valid_frames):
+                    end = min(start + current_bs, len(valid_frames))
+                    batch_frames = valid_frames[start:end]
+                    try:
+                        batch_feats = reltr_feature_batch_353(batch_frames, model, transform, args.device, args.threshold)
+                        for bf in batch_feats:
+                            feat[write_index] = bf
+                            write_index += 1
+                        start = end
+                    except Exception as exc:
+                        if is_cuda_oom_error(exc) and current_bs > 1:
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            next_bs = max(1, current_bs // 2)
+                            print(f"[WARN] scene OOM, reduce batch {current_bs}->{next_bs}")
+                            current_bs = next_bs
+                            continue
+                        raise
                 np.save(out_path, feat)
                 done += 1
             except Exception as exc:
