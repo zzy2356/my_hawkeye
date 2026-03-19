@@ -18,23 +18,31 @@
 
 ### 0.1 安装依赖
 
+**推荐方式（使用 requirements.txt）：**
+
 ```bash
 cd $WORK_ROOT
 
-# Qwen3-VL 核心依赖
+# 方法 A: 使用标准 requirements.txt（推荐）
+pip install -r requirements.txt
+
+# 方法 B: 使用快速升级脚本
 bash scripts/qwen3vl/upgrade_env.sh
 ```
 
-脚本内容等价于：
+`requirements.txt` 等价内容：
 
-```bash
-pip install -U "transformers>=4.57.0" "accelerate>=0.34.0" "tokenizers>=0.21.0"
-pip install -U "qwen-vl-utils[decord]==0.0.14"   # 视频解码加速（可选但推荐）
-pip install torch-geometric                       # SceneGraphTower GTN 必需
-pip install fairscale                             # LLaVA trainer 内存优化
-pip install deepspeed                             # ZeRO-2 分布式训练
-pip install -U "peft>=0.9.0"                      # LoRA
-pip install mmengine fvcore iopath decord av opencv-python-headless pandas tqdm
+```
+transformers>=4.57.0,<4.60.0
+tokenizers>=0.21.0,<0.22.0
+accelerate>=0.34.0,<1.0.0
+deepspeed==0.17.1
+peft>=0.9.0
+bitsandbytes>=0.45.0
+qwen-vl-utils[decord]==0.0.14    # 视频解码加速（可选但推荐）
+torch-geometric>=2.6.0           # SceneGraphTower GTN 必需
+fairscale>=0.4.13                # Trainer 内存优化
+pandas tqdm numpy pillow opencv-python
 ```
 
 ### 0.2 验证方法
@@ -541,9 +549,47 @@ python scripts/qwen3vl/smoke_infer.py ... --print-shapes
 
 1. **MoE 路由公式**：原版用 `sigmoid → normalize`，新版用 `softmax`
 2. **标签掩码策略**：新版更准确但依赖 assistant sentinel token 布局
-3. **LoRA 覆盖范围**：新版仅覆盖 attention 层（`q/k/v/o_proj`），未覆盖 MLP 层
+3. **LoRA 覆盖范围**：新版覆盖 `q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj`（含 MLP 层）
 
 这些差异不影响运行，但如需严格对齐原论文实现可作为后续优化方向。
+
+---
+
+## 关键实现说明 / Implementation Notes
+
+### Qwen3VLHawkeyeTrainer
+
+训练时使用 `Qwen3VLHawkeyeTrainer`（见 `llava/train/llava_trainer.py`）。  
+相比 `LLaVATrainer`，主要改进：
+
+- **中间 checkpoint 保存 Hawkeye 权重**：每次触发 `_save_checkpoint` 时，额外将 Hawkeye 非 LoRA 模块状态（pose/scene/moe 塔）保存为 `hawkeye_non_lora.bin`，避免训练被中断后重启时丢失已学习的增强模块权重。
+
+- **加载恢复时自动读取**：`load_pretrained_qwen3vl_hawkeye_model` 会先尝试读取 `non_lora_trainables.bin`（训练完成时生成），再尝试读取 `hawkeye_non_lora.bin`（中间 checkpoint）。
+
+```bash
+# 检查中间 checkpoint 是否含 Hawkeye 权重
+python -c "
+import torch
+ckpt = torch.load('output_folder/Hawkeye-Qwen3VL-debug/checkpoint-2/hawkeye_non_lora.bin', map_location='cpu')
+print([k for k in ckpt.keys()])
+"
+```
+
+### 缓存目录 HAWKEYE_CACHE_DIR
+
+模型加载时的 HuggingFace 缓存目录通过 `HAWKEYE_CACHE_DIR` 环境变量控制：
+
+```bash
+# 不设置时不传 cache_dir（使用 HF 默认的 ~/.cache/huggingface/）
+export HAWKEYE_CACHE_DIR=/home/djingwang/zyzhu/hf_cache
+```
+
+### 依赖安装（requirements.txt）
+
+```bash
+cd $WORK_ROOT
+pip install -r requirements.txt
+```
 
 ---
 

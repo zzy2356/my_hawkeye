@@ -173,3 +173,52 @@ class LLaVATrainer(Trainer):
             pass
         else:
             super(LLaVATrainer, self)._save(output_dir, state_dict)
+
+
+class Qwen3VLHawkeyeTrainer(Trainer):
+    """Trainer for the Qwen3-VL + Hawkeye pipeline.
+
+    The standard HuggingFace :class:`Trainer` only saves LoRA adapter weights
+    during intermediate checkpoints.  Hawkeye auxiliary modules
+    (``pose_tower``, ``scene_tower``, ``moe``, and their projectors) are
+    trainable but are *not* part of the LoRA adapter, so they would be silently
+    dropped at every ``save_steps`` checkpoint and lost on training resume.
+
+    This subclass overrides ``_save_checkpoint`` to additionally persist the
+    Hawkeye module parameters in a dedicated ``hawkeye_non_lora.bin`` file
+    inside each checkpoint directory, mirroring the ``non_lora_trainables.bin``
+    saved at the very end of training in ``train.py``.
+    """
+
+    HAWKEYE_MODULE_NAMES: tuple = (
+        "pose_tower",
+        "pose_projector",
+        "scene_tower",
+        "scene_projector",
+        "moe",
+        "moe_projector",
+    )
+
+    def _save_checkpoint(self, model, trial, metrics=None):
+        # Let the parent handle the standard LoRA / full checkpoint save.
+        super()._save_checkpoint(model, trial, metrics)
+
+        # Only the rank-0 process writes the extra file.
+        if self.args.local_rank not in (-1, 0):
+            return
+
+        from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+        checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+        run_dir = self._get_output_dir(trial=trial)
+        output_dir = os.path.join(run_dir, checkpoint_folder)
+
+        hawkeye_state = get_mm_adapter_state_maybe_zero_3(
+            model.named_parameters(),
+            keys_to_match=list(self.HAWKEYE_MODULE_NAMES),
+        )
+        if hawkeye_state:
+            os.makedirs(output_dir, exist_ok=True)
+            torch.save(
+                hawkeye_state,
+                os.path.join(output_dir, "hawkeye_non_lora.bin"),
+            )
