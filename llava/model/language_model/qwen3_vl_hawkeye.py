@@ -643,6 +643,41 @@ class Qwen3VLHawkeyeAdapter(nn.Module):
         self.last_debug_info = base_debug
         return model_kwargs
 
+    def prepare_inputs_labels_for_multimodal_kwargs(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Qwen-side equivalent of Hawkeye's prepare_inputs_labels_for_multimodal flow."""
+        return self._prepare_qwen_hawkeye_inputs(kwargs)
+
+    def prepare_inputs_labels_for_multimodal(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Any] = None,
+        labels: Optional[torch.Tensor] = None,
+        X_modalities: Optional[Any] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        """Compatibility helper for compare-mode callers expecting a Hawkeye-style prepare step."""
+        model_kwargs = dict(kwargs)
+        if input_ids is not None:
+            model_kwargs["input_ids"] = input_ids
+        if attention_mask is not None:
+            model_kwargs["attention_mask"] = attention_mask
+        if labels is not None:
+            model_kwargs["labels"] = labels
+        if position_ids is not None:
+            model_kwargs["position_ids"] = position_ids
+        if X_modalities is not None:
+            model_kwargs["images"] = X_modalities
+        prepared_kwargs = self.prepare_inputs_labels_for_multimodal_kwargs(model_kwargs)
+        return (
+            prepared_kwargs.get("input_ids", input_ids),
+            prepared_kwargs.get("attention_mask", attention_mask),
+            past_key_values,
+            prepared_kwargs.get("inputs_embeds", None),
+            prepared_kwargs.get("labels", labels),
+        )
+
     def _normalize_legacy_multimodal_inputs(self, legacy_images: Any) -> Dict[str, Any]:
         if not isinstance(legacy_images, (list, tuple)) or len(legacy_images) != 4:
             return {"images": legacy_images}
@@ -665,11 +700,11 @@ class Qwen3VLHawkeyeAdapter(nn.Module):
         return normalized
 
     def forward(self, *args, **kwargs):
-        model_kwargs = self._prepare_qwen_hawkeye_inputs(kwargs)
+        model_kwargs = self.prepare_inputs_labels_for_multimodal_kwargs(kwargs)
         return self.model(*args, **model_kwargs)
 
     def generate(self, *args, **kwargs):
-        model_kwargs = self._prepare_qwen_hawkeye_inputs(kwargs)
+        model_kwargs = self.prepare_inputs_labels_for_multimodal_kwargs(kwargs)
         # After _splice_hawkeye_tokens the true prefix length is the length of
         # the attention_mask that was sent to the backbone, NOT the original
         # input_ids length.  Store it so callers can trim generated tokens

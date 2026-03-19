@@ -368,15 +368,33 @@ Runtime load rule:
 
 ### What is now correct
 
-1. Qwen path no longer treats Hawkeye tokens as a completely separate branch from
-   the visual embeddings.
-2. Qwen visual embeddings are now materialized before Hawkeye token splice.
-3. Pose / scene / GNN / MoE still remain active and are still specific to the
-   IasDig scene-enhancement path.
+1. Qwen path still uses the Hawkeye-specific `pose -> scene graph -> MoE -> splice`
+   enhancement chain.
+2. Qwen visual embeddings are materialized before Hawkeye token splice.
+3. Qwen wrapper now exposes a `prepare_inputs_labels_for_multimodal`-style
+   compatibility entry so training and inference logic can be compared against
+   the legacy path more directly.
+4. Qwen supervision masking no longer depends on a hard-coded assistant token id;
+   it is derived from chat-template prefix lengths.
+
+### Current shared-contract status
+
+1. `llava/model/hawkeye_modules.py` is now closer to the original Hawkeye
+   contract:
+   - `PoseTower` keeps the original per-frame pose projection behavior.
+   - `SceneGraphTower` uses the original GTN-style graph construction and
+     output contract.
+   - `HawkeyeMoE` restores the original router contract:
+     `sigmoid -> normalize -> expert weighting`.
+2. Qwen path still differs from legacy Hawkeye in one structural sense:
+   Qwen visual embeddings are first materialized by the Qwen backbone and then
+   Hawkeye tokens are inserted into that embedding stream. This is the intended
+   Qwen-compatible equivalent of the original placeholder replacement path.
 
 ### What still needs runtime verification
 
 1. exact visual encoder call signature on the target server environment
-2. multimodal embedding count matching Qwen's `video_token_id` span
-3. full smoke generation on a real video sample
-4. debug training for 2 steps
+2. full smoke generation on a real video sample with real `pose/scene` features
+3. debug training for 2 steps with the restored shared Hawkeye contract
+4. checkpoint reload after LoRA + `non_lora_trainables.bin`
+5. evaluation CSV stability on a real IASDig test folder

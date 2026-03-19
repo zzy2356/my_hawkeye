@@ -6,9 +6,6 @@ import torch
 from llava.constants import IGNORE_INDEX
 
 
-ASSISTANT_TOKEN_ID = 77091
-
-
 def get_rope_index_3(
     spatial_merge_size: int = 2,
     input_ids: Optional[torch.LongTensor] = None,
@@ -157,21 +154,26 @@ def _build_messages(
     return messages
 
 
-def _build_labels(input_ids: torch.Tensor, eos_token_id: int) -> torch.Tensor:
+def _template_length(messages: Sequence[Dict], processor, add_generation_prompt: bool) -> int:
+    data_dict = processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=add_generation_prompt,
+        return_dict=True,
+        return_tensors="pt",
+    )
+    return int(data_dict["input_ids"].shape[1])
+
+
+def _build_labels(messages: Sequence[Dict], processor, input_ids: torch.Tensor) -> torch.Tensor:
     labels = torch.full_like(input_ids, IGNORE_INDEX)
-    flat_ids = input_ids[0].tolist()
-    pos = 0
-    seq_len = len(flat_ids)
-    while pos < seq_len:
-        if flat_ids[pos] == ASSISTANT_TOKEN_ID:
-            ans_start = pos + 2
-            ans_end = ans_start
-            while ans_end < seq_len and flat_ids[ans_end] != eos_token_id:
-                ans_end += 1
-            if ans_end < seq_len:
-                labels[0, ans_start: ans_end + 2] = input_ids[0, ans_start: ans_end + 2]
-                pos = ans_end
-        pos += 1
+    for msg_idx, message in enumerate(messages):
+        if message.get("role") != "assistant":
+            continue
+        prefix_len = _template_length(messages[:msg_idx], processor, add_generation_prompt=True)
+        full_len = _template_length(messages[: msg_idx + 1], processor, add_generation_prompt=False)
+        if full_len > prefix_len:
+            labels[0, prefix_len:full_len] = input_ids[0, prefix_len:full_len]
     return labels
 
 
@@ -214,7 +216,7 @@ def preprocess_qwen3vl_visual(
     data_dict["attention_mask"] = attention_mask
     data_dict["position_ids"] = position_ids
     if include_labels:
-        data_dict["labels"] = _build_labels(input_ids, eos_token_id=processor.tokenizer.eos_token_id)
+        data_dict["labels"] = _build_labels(messages, processor, input_ids)
     return data_dict
 
 
