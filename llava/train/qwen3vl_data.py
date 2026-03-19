@@ -192,11 +192,17 @@ def _build_labels(input_ids: torch.Tensor, eos_token_id: int, assistant_token_id
     seq_len = len(flat_ids)
     while pos < seq_len:
         if flat_ids[pos] == assistant_token_id:
+            # Qwen3/Qwen2 chat format: <|im_start|> assistant \n {response} <|im_end|>
+            # flat_ids[pos] is "assistant", pos+1 is the newline token, pos+2 is the
+            # first actual response token.
             ans_start = pos + 2
             ans_end = ans_start
             while ans_end < seq_len and flat_ids[ans_end] != eos_token_id:
                 ans_end += 1
             if ans_end < seq_len:
+                # Include the response text plus the EOS token (<|im_end|>) that
+                # closes the assistant turn.  The +2 accounts for EOS itself (at
+                # ans_end) and the trailing newline that follows it in the template.
                 labels[0, ans_start: ans_end + 2] = input_ids[0, ans_start: ans_end + 2]
                 pos = ans_end
         pos += 1

@@ -2,6 +2,7 @@ from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch_geometric.nn as gnn
 from torch_geometric.data import Data
 from torch_geometric.nn import MessagePassing
@@ -144,27 +145,67 @@ class SceneGraphTower(nn.Module):
 
 
 class Mlp(nn.Module):
+    """MLP router matching the original llava_arch.Mlp exactly.
+
+    The original class accepts ``hidden_features`` as a positional argument but
+    never uses it for the linear dimensions — ``fc1`` maps
+    ``in_features → out_features`` and ``fc2`` maps ``out_features → out_features``.
+    Preserving this exact weight shape is required for checkpoint compatibility
+    and to keep the routing-weight computation identical to the original MOE.
+    """
+
     def __init__(self, in_features: int, hidden_features: int, out_features: int):
         super().__init__()
-        self.fc1 = nn.Linear(in_features, hidden_features)
+        # NOTE: hidden_features is intentionally not used for the linear layer
+        # dimensions — this matches the original llava_arch.Mlp behaviour where
+        # fc1 outputs to out_features (not hidden_features).
+        self.fc1 = nn.Linear(in_features, out_features)
         self.act = nn.GELU()
-        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.fc2 = nn.Linear(out_features, out_features)
 
-    def forward(self, x):
-        return self.fc2(self.act(self.fc1(x)))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.fc2(x)
+        return x
+
+
+class SwiGLUFFN(nn.Module):
+    """SwiGLU feed-forward network matching the original FeedForward in llava_arch.py.
+
+    Computes ``w2(silu(w1(x)) * w3(x))`` with the same hidden dimension
+    calculation (``int(2/3 * 4 * dim)``, rounded up to the nearest
+    ``multiple_of=256``) used in the original ``TransformerBlock``.
+    """
+
+    def __init__(self, hidden_size: int, multiple_of: int = 256):
+        super().__init__()
+        hidden_dim = int(2 * hidden_size * 4 / 3)
+        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+        self.w1 = nn.Linear(hidden_size, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, hidden_size, bias=False)
+        self.w3 = nn.Linear(hidden_size, hidden_dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
 class ResamplerBlock(nn.Module):
+    """Resampler attention block matching the original TransformerBlock structure.
+
+    Uses ``RMSNorm`` pre-norm (matching ``TransformerBlock.attention_norm`` /
+    ``ffn_norm``) and ``SwiGLUFFN`` (matching the original ``FeedForward``).
+    The attention uses ``nn.MultiheadAttention`` as a drop-in for the original
+    ``Attention`` module called with ``start_pos=0, freqs_cis=None, mask=None``
+    (i.e. plain bidirectional self-attention without rotary embeddings).
+    """
+
     def __init__(self, hidden_size: int, num_heads: int):
         super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size)
+        self.norm1 = nn.RMSNorm(hidden_size)
         self.attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
-        self.norm2 = nn.LayerNorm(hidden_size)
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size * 4),
-            nn.GELU(),
-            nn.Linear(hidden_size * 4, hidden_size),
-        )
+        self.norm2 = nn.RMSNorm(hidden_size)
+        self.mlp = SwiGLUFFN(hidden_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
@@ -201,14 +242,6 @@ class HawkeyeMoE(nn.Module):
         self.last_routing_weights: Optional[torch.Tensor] = None
         self.last_debug: Dict[str, Any] = {}
 
-    def _resize_sequence(self, x: torch.Tensor) -> torch.Tensor:
-        if x.size(1) == self.scene_token_count:
-            return x
-        if x.size(1) > self.scene_token_count:
-            return x[:, :self.scene_token_count]
-        pad = x[:, -1:, :].expand(-1, self.scene_token_count - x.size(1), -1)
-        return torch.cat([x, pad], dim=1)
-
     def forward(self, pose_feat: torch.Tensor, scene_feat: torch.Tensor) -> torch.Tensor:
         if pose_feat.ndim == 2:
             pose_feat = pose_feat.unsqueeze(0)
@@ -231,6 +264,11 @@ class HawkeyeMoE(nn.Module):
             expert_weight = routing_weights[:, :self.scene_token_count, expert_id].unsqueeze(-1)
             expert_outputs.append(expert_hidden * expert_weight)
         output = self.out_proj(sum(expert_outputs))
+        # NOTE: output shape is (B, scene_token_count, hidden_size).
+        # The original MOE returned image_feats.reshape(-1, 4096) which flattened
+        # the batch dimension for the single-sample B=1 case.  Here, callers
+        # (moe_route) invoke .squeeze(0) which is equivalent for B=1, while
+        # remaining safe for batched evaluation paths.
         dominant_experts = routing_weights.argmax(dim=-1)
         expert_token_counts = [
             int((dominant_experts == expert_id).sum().item()) for expert_id in range(self.num_experts)
@@ -267,7 +305,10 @@ def build_scene_projector(hidden_size: int) -> nn.Module:
 
 
 def build_moe(hidden_size: int, scene_token_count: int = 30) -> HawkeyeMoE:
-    num_heads = max(1, min(8, hidden_size // 256))
+    # Match original resampler_params.n_heads = 16.  For Qwen3-VL-8B
+    # hidden_size=4096: 4096 / 16 = 256, so 16 heads divides evenly.
+    # Fall back to a safe divisor when hidden_size is not a multiple of 16.
+    num_heads = 16 if hidden_size % 16 == 0 else max(1, min(8, hidden_size // 256))
     return HawkeyeMoE(hidden_size=hidden_size, num_heads=num_heads, scene_token_count=scene_token_count)
 
 
