@@ -6,7 +6,35 @@ import torch
 from llava.constants import IGNORE_INDEX
 
 
+# Fallback constant kept for backward-compatibility.  Actual detection is
+# done at runtime via _get_assistant_token_id() so that changes to the
+# Qwen3/Qwen2 chat template or tokenizer vocabulary do not silently break
+# label masking.
 ASSISTANT_TOKEN_ID = 77091
+# Template string used to locate the "assistant" token in the live tokenizer.
+_ASSISTANT_TEMPLATE = "<|im_start|>assistant"
+
+
+def _get_assistant_token_id(processor) -> int:
+    """Detect the assistant-turn header token ID from the tokenizer at runtime.
+
+    Qwen3/Qwen2 chat format uses ``<|im_start|>assistant\\n``.
+    ``<|im_start|>`` is a single special token; ``assistant`` is the
+    immediately following ordinary token whose ID we need.
+
+    Falls back to the module-level ``ASSISTANT_TOKEN_ID`` constant if
+    detection fails (e.g. during unit tests that use a stub processor).
+    """
+    try:
+        tokenizer = getattr(processor, "tokenizer", processor)
+        ids = tokenizer.encode(_ASSISTANT_TEMPLATE, add_special_tokens=False)
+        # ids[0] is <|im_start|>, ids[1] is "assistant"
+        if len(ids) >= 2:
+            return int(ids[1])
+        # Some tokenizers may merge them; in that case fall back.
+    except Exception:
+        pass
+    return ASSISTANT_TOKEN_ID
 
 
 def get_rope_index_3(
@@ -157,13 +185,13 @@ def _build_messages(
     return messages
 
 
-def _build_labels(input_ids: torch.Tensor, eos_token_id: int) -> torch.Tensor:
+def _build_labels(input_ids: torch.Tensor, eos_token_id: int, assistant_token_id: int = ASSISTANT_TOKEN_ID) -> torch.Tensor:
     labels = torch.full_like(input_ids, IGNORE_INDEX)
     flat_ids = input_ids[0].tolist()
     pos = 0
     seq_len = len(flat_ids)
     while pos < seq_len:
-        if flat_ids[pos] == ASSISTANT_TOKEN_ID:
+        if flat_ids[pos] == assistant_token_id:
             ans_start = pos + 2
             ans_end = ans_start
             while ans_end < seq_len and flat_ids[ans_end] != eos_token_id:
@@ -214,7 +242,8 @@ def preprocess_qwen3vl_visual(
     data_dict["attention_mask"] = attention_mask
     data_dict["position_ids"] = position_ids
     if include_labels:
-        data_dict["labels"] = _build_labels(input_ids, eos_token_id=processor.tokenizer.eos_token_id)
+        assistant_token_id = _get_assistant_token_id(processor)
+        data_dict["labels"] = _build_labels(input_ids, eos_token_id=processor.tokenizer.eos_token_id, assistant_token_id=assistant_token_id)
     return data_dict
 
 
